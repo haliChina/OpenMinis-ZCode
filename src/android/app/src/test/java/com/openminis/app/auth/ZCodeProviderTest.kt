@@ -74,10 +74,12 @@ class ZCodeProviderTest {
     private fun makeJwt(userId: String, expSeconds: Long): String {
         fun b64(s: String) =
             Base64.getUrlEncoder().withoutPadding().encodeToString(s.toByteArray(Charsets.UTF_8))
-        val payload = """{"user_id":"$userId","exp":$expSeconds}"""
-        return "${b64("""{"alg":"HS256","typ":"JWT"}")}.${
-            b64(payload)
-        }.signature"
+        // NOTE: do not inline the raw strings into one "${...}" template:
+        // a raw string nested inside a multi-line template entry breaks
+        // the Kotlin parser (syntax error at EOF). Build the parts first.
+        val header = b64("""{"alg":"HS256","typ":"JWT"}""")
+        val payload = b64("""{"user_id":"$userId","exp":$expSeconds}""")
+        return "$header.$payload.signature"
     }
 
     @Test
