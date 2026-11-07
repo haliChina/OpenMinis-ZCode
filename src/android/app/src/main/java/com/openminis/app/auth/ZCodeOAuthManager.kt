@@ -8,6 +8,7 @@ import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import java.security.SecureRandom
 
@@ -117,6 +118,59 @@ class ZCodeOAuthManager(
         /** EncryptedPrefs key for the stable device id (see [deviceMid]). */
         const val KEY_DEVICE_MID = "zcode_device_mid"
 
+        /** Persisted balance-derived model ids (#14), JSON array string. */
+        private const val KEY_BALANCE_MODELS = "zcode_balance_models"
+
+        /** 1005 circuit-breaker states (#9), JSON map string. */
+        private const val KEY_CLAIM_CIRCUIT = "zcode_claim_circuit"
+
+        /** Same-day claim ledger entries (#11), JSON array string. */
+        private const val KEY_CLAIM_LEDGER = "zcode_claim_ledger"
+
+        /** Last version-manifest check, epoch ms (#19). */
+        private const val KEY_VERSION_CHECK_AT = "zcode_version_check_at"
+
+        /** Adopted client version override (#19), e.g. "3.17.2". */
+        private const val KEY_CLIENT_VERSION = "zcode_client_version"
+
+        /** 5 days between manifest checks (#19). */
+        const val VERSION_CHECK_INTERVAL_MS = 5 * 24 * 60 * 60 * 1000L
+
+        /** 429 backoff for billing/claim calls (#12): 1s then 3s, at
+         *  most two retries. (hj01857655 uses 60s/120s — too long for a
+         *  manual console tap; pjpv uses 500/1500/4000ms. 1s/3s is the
+         *  middle ground for a user waiting on a button.) */
+        val RETRY_429_DELAYS_MS = longArrayOf(1_000L, 3_000L)
+
+        fun retry429DelayMs(attempt: Int): Long? =
+            RETRY_429_DELAYS_MS.getOrNull(attempt)
+
+        /**
+         * marketing/touch seq counter (#6): starts at 0, +1 per call
+         * (hj01857655 claim.go:506-511 `touchSeq atomic.Uint64`). A
+         * fixed seq=0 may be deduped upstream as a repeat.
+         */
+        private val touchSeq = java.util.concurrent.atomic.AtomicLong(0)
+
+        fun nextTouchSeq(): Long = touchSeq.getAndIncrement()
+
+        /** Parse a client/configs body into a captcha config (#16).
+         *  Null when the body carries no usable captcha section. */
+        fun parseCaptchaConfig(body: String): ZCodeCaptchaGate.Config? {
+            val captcha = runCatching {
+                JSONObject(body).optJSONObject("data")
+                    ?.optJSONObject("configs")?.optJSONObject("captcha")
+            }.getOrNull() ?: return null
+            val sceneId = captcha.optString("sceneId", "").ifEmpty { return null }
+            return ZCodeCaptchaGate.Config(
+                sceneId = sceneId,
+                region = captcha.optString("region", "cn"),
+                prefix = captcha.optString("prefix", "no8xfe"),
+                skipModelRequest = captcha.optBoolean("skip_model_request", false),
+                enabled = captcha.optBoolean("enabled", true),
+            )
+        }
+
         private val JSON_MEDIA = "application/json".toMediaType()
 
         /**
@@ -142,12 +196,12 @@ class ZCodeOAuthManager(
          * `redirect` is pointed here so the browser lands back on the
          * polling bridge instead of the deep link. `app_version` must be
          * above 3.9.1 for the website to enable the bridge; ours is
-         * [ZCodeConstants.CLIENT_APP_VERSION].
+         * [ZCodeConstants.appVersion].
          */
         fun buildBigModelRelayUrl(): String =
             "https://zcode.z.ai/app/oauth/login" +
                 "?redirect=zcode://oauth/callback" +
-                "&app_version=${ZCodeConstants.CLIENT_APP_VERSION}"
+                "&app_version=${ZCodeConstants.appVersion()}"
 
         /**
          * Rewrite the authorize URL for the chosen provider. `zai` is
@@ -346,6 +400,20 @@ class ZCodeOAuthManager(
     override val callbackPort: Int get() = 0
     override val redirectPath: String get() = ""
     override val scopes: String get() = ""
+
+    init {
+        // Adopt a previously stored version override (#19) so the
+        // manifest auto-follow survives restarts. Only upgrades are
+        // ever stored, so this never moves the version backwards.
+        loadOAuthString(KEY_CLIENT_VERSION)?.takeIf { it.isNotBlank() }?.let {
+            if (ZCodeConstants.isNewerVersion(it, ZCodeConstants.appVersion())) {
+                ZCodeConstants.appVersionOverride = it
+            }
+        }
+    }
+
+    /** The logged-in account's user id, from the JWT payload. */
+    suspend fun userId(): String? = validAccessToken()?.let { jwtUserId(it) }
 
     /** The plan JWT, or null when absent/expired. No refresh exists. */
     override suspend fun validAccessToken(): String? = withContext(Dispatchers.IO) {
@@ -569,21 +637,47 @@ class ZCodeOAuthManager(
     // ── Billing / claim (manual console) ───────────────────────────────
 
     suspend fun fetchBillingBalance(): ApiResult = billingAuthed("GET", "billing/balance", null)
+        .also { result ->
+            // #14: remember the balance-derived model ids so the model
+            // list can prefer them over the static plan list. Only on
+            // HTTP success — a failed read must not wipe the last good
+            // list.
+            if (result.httpStatus in 200..299) {
+                val ids = ZCodeActivation.parseBalanceModelIds(result.body)
+                if (ids.isNotEmpty()) {
+                    saveOAuthString(KEY_BALANCE_MODELS, JSONArray(ids).toString())
+                }
+            }
+        }
+
     suspend fun fetchBillingCurrent(): ApiResult = billingAuthed("GET", "billing/current", null)
+
+    /** Balance-derived model ids (#14), or empty when no balance has
+     *  been read yet — the caller falls back to the static plan list. */
+    fun balanceModelIds(): List<String> {
+        val raw = loadOAuthString(KEY_BALANCE_MODELS) ?: return emptyList()
+        val arr = runCatching { JSONArray(raw) }.getOrNull() ?: return emptyList()
+        val out = mutableListOf<String>()
+        for (i in 0 until arr.length()) {
+            arr.optString(i, "").takeIf { it.isNotEmpty() }?.let { out.add(it) }
+        }
+        return out
+    }
 
     /** Preview carries the query parameters upstream wants
      *  (app_version + platform, same platform value as X-Platform). */
     suspend fun fetchBillingPreview(): ApiResult = billingAuthed(
         "GET",
         ZCodeActivation.buildPreviewPath(
-            ZCodeConstants.CLIENT_APP_VERSION,
+            ZCodeConstants.appVersion(),
             currentPlatform(),
         ),
         null,
     )
 
     /**
-     * GET marketing/touch — the campaign-drop discovery channel. Never
+     * GET marketing/touch — the campaign-drop discovery channel. The
+     * seq increments on every call (#6, hj01857655 `touchSeq`). Never
      * throws and never triggers a captcha dialog: any failure (no login,
      * network, HTTP, business code) is reported as an empty result and
      * the caller falls back to the preview list alone. The raw body is
@@ -593,7 +687,7 @@ class ZCodeOAuthManager(
         runCatching {
             val jwt = validAccessToken() ?: return@withContext ApiResult(0, null, "")
             val builder = Request.Builder()
-                .url(ZCodeConstants.MARKETING_TOUCH_URL)
+                .url(ZCodeConstants.touchUrl(nextTouchSeq()))
                 .get()
             applyBillingHeaders(builder, jwt)
             val response = httpClient.newCall(builder.build()).execute()
@@ -604,6 +698,89 @@ class ZCodeOAuthManager(
                 .takeIf { it >= 0 }
             ApiResult(status, code, body)
         }.getOrElse { ApiResult(0, null, "") }
+    }
+
+    /**
+     * Post-claim touch confirm receipt (#7): `POST
+     * /marketing/touch/action {"campaign_id":…, "action_type":"confirm"}`.
+     * Best-effort only — a failure is logged and never affects the
+     * claim result (hj01857655 claim.go:601-616). Returns true when
+     * upstream accepted it (HTTP < 400 and code == 0). Never throws.
+     */
+    suspend fun confirmTouchAction(campaignId: String): Boolean =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val jwt = validAccessToken() ?: return@runCatching false
+                val builder = Request.Builder()
+                    .url(ZCodeConstants.TOUCH_CONFIRM_URL)
+                    .post(
+                        ZCodeActivation.buildTouchConfirmBody(campaignId).toString()
+                            .toRequestBody(JSON_MEDIA),
+                    )
+                applyBillingHeaders(builder, jwt)
+                val response = httpClient.newCall(builder.build()).execute()
+                val status = response.code
+                val body = response.body?.string().orEmpty()
+                response.close()
+                if (status >= 400) return@runCatching false
+                runCatching { JSONObject(body).optInt("code", -1) }.getOrDefault(-1) == 0
+            }.getOrDefault(false)
+        }
+
+    // ── Claim outcome bookkeeping (#9, #11) ───────────────────────────
+
+    private fun loadClaimCircuit(): MutableMap<String, ZCodeActivation.ClaimCircuit.State> =
+        ZCodeActivation.ClaimCircuit.deserialize(
+            loadOAuthString(KEY_CLAIM_CIRCUIT).orEmpty(),
+        ).toMutableMap()
+
+    private fun saveClaimCircuit(states: Map<String, ZCodeActivation.ClaimCircuit.State>) =
+        saveOAuthString(KEY_CLAIM_CIRCUIT, ZCodeActivation.ClaimCircuit.serialize(states))
+
+    /** True when the plan is inside its 30-minute 1005 block (#9). */
+    fun isClaimBlocked(planId: String): Boolean {
+        val state = loadClaimCircuit()[planId] ?: return false
+        return ZCodeActivation.ClaimCircuit.isBlocked(state, System.currentTimeMillis())
+    }
+
+    /** Record one 1005 on the plan; returns the updated state. */
+    fun recordClaim1005(planId: String): ZCodeActivation.ClaimCircuit.State {
+        val states = loadClaimCircuit()
+        val updated = ZCodeActivation.ClaimCircuit.record1005(
+            states[planId] ?: ZCodeActivation.ClaimCircuit.State(),
+            System.currentTimeMillis(),
+        )
+        states[planId] = updated
+        saveClaimCircuit(states)
+        return updated
+    }
+
+    /** A claim success (or 1003 "already claimed") resets the count. */
+    fun resetClaimCircuit(planId: String) {
+        val states = loadClaimCircuit()
+        states[planId] = ZCodeActivation.ClaimCircuit.recordSuccess()
+        saveClaimCircuit(states)
+    }
+
+    private fun loadClaimLedger(): MutableSet<String> =
+        ZCodeActivation.ClaimLedger.deserialize(
+            loadOAuthString(KEY_CLAIM_LEDGER).orEmpty(),
+        ).toMutableSet()
+
+    /** True when this account already claimed this plan today (#11). */
+    fun isClaimedToday(userId: String, planId: String): Boolean {
+        val day = ZCodeActivation.ClaimLedger.todayCst(System.currentTimeMillis())
+        return loadClaimLedger().contains(
+            ZCodeActivation.ClaimLedger.entryKey(userId, planId, day),
+        )
+    }
+
+    /** Record a successful (0) or already-claimed (1003) claim for today. */
+    fun recordClaimedToday(userId: String, planId: String) {
+        val entries = loadClaimLedger()
+        val day = ZCodeActivation.ClaimLedger.todayCst(System.currentTimeMillis())
+        entries.add(ZCodeActivation.ClaimLedger.entryKey(userId, planId, day))
+        saveOAuthString(KEY_CLAIM_LEDGER, ZCodeActivation.ClaimLedger.serialize(entries))
     }
 
     /**
@@ -701,10 +878,15 @@ class ZCodeOAuthManager(
     }
 
     /**
-     * One billing call with at most one manual-captcha retry. On a
-     * challenge the user is asked once via [ZCodeCaptchaGate]; cancel (or
-     * no dialog mounted) returns the ORIGINAL result with
+     * One billing call with a 429 backoff retry table (#12) and at most
+     * one manual-captcha retry. On a challenge the user is asked once
+     * via [ZCodeCaptchaGate] — unless the live config says model
+     * requests skip verification ([ZCodeCaptchaGate.Config.skipModelRequest],
+     * #16), in which case no dialog is opened at all. Cancel (or no
+     * dialog mounted) returns the ORIGINAL result with
      * [ApiResult.captchaCancelled] set — the caller reports "已取消，未扣额度".
+     * 3012 is never retried: it is not a captcha challenge and a fresh
+     * param does not help.
      */
     private suspend fun billingRaw(
         method: String,
@@ -713,13 +895,24 @@ class ZCodeOAuthManager(
         jsonBody: JSONObject?,
         allowCaptchaRetry: Boolean,
     ): ApiResult = withContext(Dispatchers.IO) {
-        val first = executeBilling(method, path, jwt, jsonBody, verifyParam = null, region = null)
+        var first = executeBilling(method, path, jwt, jsonBody, verifyParam = null, region = null)
+        // #12: 429 (rate limit) backs off and retries — at most twice.
+        // 3012 / 3007 / anything else is not retried here: 3007 goes
+        // through the captcha path below, 3012 is risk-control.
+        var attempt = 0
+        while (first.httpStatus == 429) {
+            val waitMs = retry429DelayMs(attempt) ?: break
+            delay(waitMs)
+            attempt++
+            first = executeBilling(method, path, jwt, jsonBody, verifyParam = null, region = null)
+        }
         if (!allowCaptchaRetry || !first.captchaChallenge) return@withContext first
         val config = runCatching { fetchCaptchaConfig(jwt) }
             .getOrDefault(ZCodeCaptchaGate.Config.FALLBACK)
+        if (config.skipModelRequest) return@withContext first
         val param = ZCodeCaptchaGate.requestVerification(config)
             ?: return@withContext first.copy(captchaCancelled = true)
-        // Param is single-use and ~95s TTL: use it immediately, once.
+        // Param is single-use and ~40s TTL (#15): use it immediately, once.
         executeBilling(method, path, jwt, jsonBody, verifyParam = param, region = config.region)
             .copy(retriedWithCaptcha = true)
     }
@@ -744,10 +937,10 @@ class ZCodeOAuthManager(
     private fun applyBillingHeaders(builder: Request.Builder, jwt: String) {
         builder.header("Authorization", "Bearer $jwt")
             .header("Content-Type", "application/json")
-            .header("User-Agent", "ZCode/${ZCodeConstants.CLIENT_APP_VERSION}")
+            .header("User-Agent", "ZCode/${ZCodeConstants.appVersion()}")
             .header("HTTP-Referer", "https://zcode.z.ai")
             .header("X-Title", "Z Code@electron")
-            .header("X-ZCode-App-Version", ZCodeConstants.CLIENT_APP_VERSION)
+            .header("X-ZCode-App-Version", ZCodeConstants.appVersion())
             .header("X-Release-Channel", "production")
             .header("x-request-id", java.util.UUID.randomUUID().toString())
         for ((name, value) in currentIdentityHeaders(deviceMid())) {
@@ -791,28 +984,67 @@ class ZCodeOAuthManager(
         )
     }
 
-    /** GET client/configs → data.configs.captcha {sceneId, region, prefix}.
-     *  Falls back to the documented defaults on any failure. */
+    /** GET client/configs → data.configs.captcha {sceneId, region,
+     *  prefix, skip_model_request, enabled}. Falls back to the
+     *  documented defaults on any failure. The URL carries app_version
+     *  only — adding platform=android-arm64 3001s (verified 2026-11-07:
+     *  the endpoint accepts no platform or a desktop platform, not
+     *  android-arm64), and no Authorization is needed (code 0 without
+     *  one). The dynamic fetch is the primary source for scene/region/
+     *  prefix — the fallback is only for when the fetch itself fails. */
     suspend fun fetchCaptchaConfig(jwt: String? = null): ZCodeCaptchaGate.Config =
         withContext(Dispatchers.IO) {
             runCatching {
                 val builder = Request.Builder()
-                    .url("${ZCodeConstants.CLIENT_CONFIG_URL}?app_version=${ZCodeConstants.CLIENT_APP_VERSION}")
+                    .url("${ZCodeConstants.CLIENT_CONFIG_URL}?app_version=${ZCodeConstants.appVersion()}")
                     .get()
                 jwt?.let { builder.header("Authorization", "Bearer $it") }
                 val response = httpClient.newCall(builder.build()).execute()
                 val body = response.body?.string().orEmpty()
                 response.close()
                 if (!response.isSuccessful) return@runCatching null
-                val captcha = JSONObject(body)
-                    .optJSONObject("data")
-                    ?.optJSONObject("configs")
-                    ?.optJSONObject("captcha") ?: return@runCatching null
-                ZCodeCaptchaGate.Config(
-                    sceneId = captcha.optString("sceneId", "").ifEmpty { return@runCatching null },
-                    region = captcha.optString("region", "cn"),
-                    prefix = captcha.optString("prefix", "no8xfe"),
-                )
+                parseCaptchaConfig(body)
             }.getOrNull() ?: ZCodeCaptchaGate.Config.FALLBACK
         }
+
+    // ── Client version auto-follow (#19) ─────────────────────────────
+
+    /**
+     * Check the official Electron manifest for a newer client version,
+     * at most once per 5 days, only when the console is opened (no
+     * timer, no background job). Only upgrades are adopted
+     * ([ZCodeConstants.isNewerVersion]); a failed fetch or an
+     * unparseable manifest leaves the current version untouched and
+     * does NOT update the last-check time, so the next console open
+     * retries. Returns the effective version after the check.
+     */
+    suspend fun checkClientVersionIfDue(): String = withContext(Dispatchers.IO) {
+        val now = System.currentTimeMillis()
+        val lastCheck = loadOAuthString(KEY_VERSION_CHECK_AT)?.toLongOrNull() ?: 0L
+        if (now - lastCheck < VERSION_CHECK_INTERVAL_MS && lastCheck > 0) {
+            return@withContext ZCodeConstants.appVersion()
+        }
+        runCatching {
+            val request = Request.Builder()
+                .url(ZCodeConstants.ELECTRON_MANIFEST_URL)
+                .header("Accept", "application/x-yaml, text/yaml, */*")
+                .header("X-Platform", "win32-x64")
+                .header("X-Release-Channel", "1")
+                .get()
+                .build()
+            val response = httpClient.newCall(request).execute()
+            val body = response.body?.string().orEmpty()
+            response.close()
+            if (!response.isSuccessful) return@runCatching null
+            ZCodeConstants.parseManifestVersion(body)
+        }.getOrNull()?.let { latest ->
+            if (ZCodeConstants.isNewerVersion(latest, ZCodeConstants.appVersion())) {
+                saveOAuthString(KEY_CLIENT_VERSION, latest)
+                ZCodeConstants.appVersionOverride = latest
+                Log.i(TAG, "ZCode client version followed to $latest")
+            }
+            saveOAuthString(KEY_VERSION_CHECK_AT, now.toString())
+        }
+        ZCodeConstants.appVersion()
+    }
 }

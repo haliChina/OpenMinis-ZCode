@@ -47,15 +47,21 @@ import org.json.JSONObject
  *
  *   查额度   GET billing/balance + billing/current (raw values shown)
  *   查可领   激活上报（app_launch + app_daily_active + app_login_success）→ GET
- *            billing/preview（带 app_version/platform）→ GET
- *            marketing/touch；preview 与 touch 的计划按 plan_id 去重
- *            合并后列出（活动套餐没有上报就永远投放不下来，见
- *            ZCodeActivation）。上报失败不阻断继续。
- *   领取     POST billing/claim {"plan_id": <the id the user picked>}
+ *            marketing/touch（seq 递增）→ touch 为空时再 GET billing/preview
+ *            （带 app_version/platform）；touch 优先，preview 只作备用；
+ *            两路都空时列出日期编码兑底 id（可选手册领取，待实测）；
+ *            仍无可领时用 balance + current 交叉验证账号到底有无套餐。
+ *            上报失败不阻断继续。
+ *   领取     POST billing/claim {"plan_id": <the id the user picked>}；
+ *            当天已领过的不再重复领，连续 3 次 1005 的计划 30 分钟内
+ *            不再试；成功后发 touch confirm 回执（失败不影响结果）。
+ *   预取验证 手动预取一次验证码参数并缓存 45 秒，下次验证不再弹窗。
  *
- * One claim = one id, once. The upstream business code is shown with its
- * meaning (0=领到、1003=已领过、1001=不存在、1005=名额用完…); nothing
- * here auto-selects the "best" plan or loops over candidates.
+ * One claim = one id, once, chosen by the user. The upstream business
+ * code is shown with its meaning (0=领到、1003=已领过、1001=不存在、
+ * 1005=名额用完…); nothing here auto-selects the "best" plan or loops
+ * over candidates. The version manifest is checked at most once per 5
+ * days when this screen opens (no timer); only upgrades are adopted.
  *
  * This section also mounts [ZCodeCaptchaDialog], the single host for the
  * manual captcha flow. Chat requests that hit a 3007 while this screen is
@@ -105,11 +111,15 @@ fun ZCodeCaptchaDialog() {
 
     AlertDialog(
         onDismissRequest = { ZCodeCaptchaGate.complete(null) },
-        title = { Text("完成验证后继续") },
+        title = { Text(if (request.isPrefetch) "预取验证" else "完成验证后继续") },
         text = {
             androidx.compose.foundation.layout.Column {
                 Text(
-                    "ZCode 要求完成一次验证（无痕验证通常自动通过，需要时请在下方完成滑块 / 拼图）。验证只用于本次请求，不会被保存或复用。",
+                    if (request.isPrefetch) {
+                        "正在为下一次请求预取验证（无痕验证通常自动通过，需要时请在下方完成滑块 / 拼图）。预取到的参数只缓存 45 秒、只用一次。"
+                    } else {
+                        "ZCode 要求完成一次验证（无痕验证通常自动通过，需要时请在下方完成滑块 / 拼图）。验证只用于本次请求，不会被保存或复用。"
+                    },
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 if (errorMessage != null) {
@@ -162,23 +172,18 @@ fun ZCodeCaptchaDialog() {
 // ── Console section ────────────────────────────────────────────────────
 
 private fun parseBalanceSummary(body: String): List<String> {
+    val detail = ZCodeActivation.parseBalanceDetail(body)
     val lines = mutableListOf<String>()
-    val data = runCatching { JSONObject(body).optJSONObject("data") }.getOrNull() ?: return lines
-    val balances = data.optJSONArray("balances") ?: return lines
-    for (i in 0 until balances.length()) {
-        val b = balances.optJSONObject(i) ?: continue
-        val name = b.optString("show_name", "").ifEmpty { b.optString("model", "") }
-        val total = b.optLong("total_units", -1)
-        val used = b.optLong("used_units", -1)
-        val remaining = b.optLong("remaining_units", -1)
-        val expires = b.optString("expires_at", "")
+    for (b in detail.buckets) {
         lines.add(
             listOfNotNull(
-                name.ifEmpty { null },
-                if (remaining >= 0) "剩余 $remaining" else null,
-                if (total >= 0) "/ 共 $total" else null,
-                if (used >= 0) "(已用 $used)" else null,
-                if (expires.isNotEmpty()) "到期 $expires" else null,
+                b.name.ifEmpty { null },
+                if (b.remaining >= 0) "剩余 ${b.remaining}" else null,
+                if (b.total >= 0) "/ 共 ${b.total}" else null,
+                if (b.used >= 0) "(已用 ${b.used})" else null,
+                b.periodLabel.ifEmpty { null },
+                if (b.capabilities.isNotEmpty()) "能力 ${b.capabilities.joinToString(",")}" else null,
+                if (b.expiresAt.isNotEmpty()) "到期 ${b.expiresAt}" else null,
             ).joinToString(" ").ifEmpty { "（空）" },
         )
     }
@@ -210,6 +215,12 @@ fun ColumnScope.ZCodeConsoleSection(
     // The captcha dialog host for this screen (shared with chat).
     ZCodeCaptchaDialog()
 
+    // #19: version manifest check, at most once per 5 days, only when
+    // this screen opens. Silent — no timer, no status line.
+    androidx.compose.runtime.LaunchedEffect(instance.id) {
+        runCatching { manager.checkClientVersionIfDue() }
+    }
+
     var planMode by remember(instance.id) { mutableStateOf(manager.planMode()) }
     var busy by remember { mutableStateOf<String?>(null) }
     var statusLine by remember { mutableStateOf<String?>(null) }
@@ -219,15 +230,19 @@ fun ColumnScope.ZCodeConsoleSection(
     var touchResult by remember { mutableStateOf<ZCodeOAuthManager.ApiResult?>(null) }
     var activationResult by remember { mutableStateOf<ZCodeActivation.ActivationResult?>(null) }
     var claimResult by remember { mutableStateOf<ZCodeOAuthManager.ApiResult?>(null) }
-    var selectedPlanId by remember { mutableStateOf<String?>(null) }
+    var selectedPlan by remember { mutableStateOf<ZCodeActivation.ClaimablePlan?>(null) }
+    var fallbackPlans by remember { mutableStateOf<List<ZCodeActivation.ClaimablePlan>>(emptyList()) }
+    var crossCheck by remember { mutableStateOf<ZCodeActivation.CrossCheck?>(null) }
+    var prefetchStatus by remember { mutableStateOf<String?>(null) }
 
-    // Merged claimable plans: preview + marketing/touch, deduped by
-    // plan_id, priority desc then plan_id asc. Recomputed from the two
-    // raw results on every recomposition — parsing is tiny.
+    // Claimable plans: touch first, preview as backup, deduped by
+    // plan_id, priority desc then plan_id asc — plus date-coded
+    // fallback entries when both channels are empty. Parsing is tiny,
+    // so it is recomputed from the raw results on every recomposition.
     val claimablePlans = ZCodeActivation.mergePlans(
         previewResult?.let { ZCodeActivation.parsePreviewPlans(it.body) }.orEmpty(),
         touchResult?.let { ZCodeActivation.parseTouchDeliveries(it.body) }.orEmpty(),
-    )
+    ) + fallbackPlans
 
     fun runAction(label: String, block: suspend () -> Unit) {
         if (busy != null) return
@@ -291,16 +306,51 @@ fun ColumnScope.ZCodeConsoleSection(
                             // + date). A failed report is recorded, not
                             // fatal: preview and touch still run.
                             activationResult = manager.reportActivation()
-                            previewResult = manager.fetchBillingPreview()
+                            // #5: touch first; preview only as a backup
+                            // when touch yields nothing.
                             touchResult = manager.fetchMarketingTouch()
-                            selectedPlanId = null
-                            val r = previewResult!!
+                            val touchPlans = touchResult?.let {
+                                ZCodeActivation.parseTouchDeliveries(it.body)
+                            }.orEmpty()
+                            previewResult = if (touchPlans.isEmpty()) {
+                                manager.fetchBillingPreview()
+                            } else null
+                            val previewPlans = previewResult?.let {
+                                ZCodeActivation.parsePreviewPlans(it.body)
+                            }.orEmpty()
+                            val merged = ZCodeActivation.mergePlans(previewPlans, touchPlans)
+                            // #20: both channels empty — offer date-coded
+                            // fallback ids as selectable entries (manual
+                            // claim only, never auto-claimed).
+                            fallbackPlans = if (merged.isEmpty()) {
+                                ZCodeActivation.buildDateCodedFallbackIds(
+                                    java.time.LocalDate.now(
+                                        java.time.ZoneId.of("Asia/Shanghai"),
+                                    ),
+                                ).map { id ->
+                                    ZCodeActivation.ClaimablePlan(
+                                        id = id,
+                                        name = id,
+                                        description = "兑底（待实测）",
+                                        source = ZCodeActivation.ClaimablePlan.Source.FALLBACK,
+                                    )
+                                }
+                            } else emptyList()
+                            // #13: still nothing claimable — cross-check
+                            // with balance + current instead of calling
+                            // it an interface failure.
+                            crossCheck = if (merged.isEmpty()) {
+                                balanceResult = manager.fetchBillingBalance()
+                                currentResult = manager.fetchBillingCurrent()
+                                ZCodeActivation.crossCheckPlan(
+                                    balanceResult!!.body,
+                                    currentResult!!.body,
+                                )
+                            } else null
+                            selectedPlan = null
                             val act = activationResult!!
-                            statusLine = "激活上报${act.message}；" + if (r.captchaCancelled) {
-                                "已取消验证，未扣额度。"
-                            } else {
-                                "可领计划已读取（HTTP ${r.httpStatus}）。"
-                            }
+                            statusLine = "激活上报${act.message}；可领计划已读取" +
+                                if (merged.isEmpty()) "（两路都空，已列出兑底 id）。" else "。"
                         }
                     },
                     modifier = Modifier.fillMaxWidth(),
@@ -309,28 +359,93 @@ fun ColumnScope.ZCodeConsoleSection(
                 Spacer(Modifier.height(8.dp))
                 MinisButton(
                     onClick = {
-                        val planId = selectedPlanId ?: return@MinisButton
+                        val plan = selectedPlan ?: return@MinisButton
                         runAction("领取") {
-                            claimResult = manager.claimPlan(planId)
+                            val uid = manager.userId().orEmpty()
+                            // #11: already claimed today — do not repeat.
+                            if (uid.isNotEmpty() && manager.isClaimedToday(uid, plan.id)) {
+                                statusLine = "今天已领过 ${plan.id}，不再重复领取。"
+                                return@runAction
+                            }
+                            // #9: 3 consecutive 1005s block the plan for
+                            // 30 minutes.
+                            if (manager.isClaimBlocked(plan.id)) {
+                                statusLine = "该计划因连续 3 次名额用完，30 分钟内不再尝试。"
+                                return@runAction
+                            }
+                            claimResult = manager.claimPlan(plan.id)
                             val r = claimResult!!
                             statusLine = when {
                                 r.captchaCancelled -> "已取消验证，未扣额度。"
+                                r.code == 1005 -> {
+                                    manager.recordClaim1005(plan.id)
+                                    val next = ZCodeActivation.parseClaimNextAvailableAt(r.body)
+                                    // #9 self-heal: refresh the balance
+                                    // and re-check instead of trusting
+                                    // the stale read.
+                                    balanceResult = manager.fetchBillingBalance()
+                                    val cc = ZCodeActivation.crossCheckPlan(
+                                        balanceResult!!.body,
+                                        currentResult?.body.orEmpty(),
+                                    )
+                                    "领取结果：名额已用完（code=1005）" +
+                                        (if (next != null) "，下次可领时间：$next" else "") +
+                                        "；${cc.summary}。"
+                                }
+                                r.code == 1003 -> {
+                                    manager.resetClaimCircuit(plan.id)
+                                    if (uid.isNotEmpty()) manager.recordClaimedToday(uid, plan.id)
+                                    "领取结果：已领取过（code=1003）。"
+                                }
+                                ZCodeActivation.claimSucceeded(r.code, r.body) -> {
+                                    manager.resetClaimCircuit(plan.id)
+                                    if (uid.isNotEmpty()) manager.recordClaimedToday(uid, plan.id)
+                                    // #7: touch confirm receipt —
+                                    // best-effort, never blocks the result.
+                                    if (plan.campaignId.isNotEmpty()) {
+                                        manager.confirmTouchAction(plan.campaignId)
+                                    }
+                                    balanceResult = manager.fetchBillingBalance()
+                                    planMode = manager.refreshPlanMode()
+                                    "领取成功：${plan.name}。"
+                                }
                                 r.code != null -> "领取结果：${ZCodeConstants.claimCodeMeaning(r.code)}（code=${r.code}）"
                                 else -> "领取返回 HTTP ${r.httpStatus}。"
-                            }
-                            if (r.code == 0) {
-                                balanceResult = manager.fetchBillingBalance()
-                                planMode = manager.refreshPlanMode()
                             }
                         }
                     },
                     modifier = Modifier.fillMaxWidth(),
-                    enabled = busy == null && selectedPlanId != null,
+                    enabled = busy == null && selectedPlan != null,
                 ) { Text(if (busy == "领取") "领取中…" else "领取选中计划") }
+                Spacer(Modifier.height(8.dp))
+                MinisButton(
+                    onClick = {
+                        runAction("预取验证") {
+                            val config = manager.fetchCaptchaConfig()
+                            if (config.skipModelRequest) {
+                                prefetchStatus = "当前配置跳过模型请求验证，无需预取。"
+                                return@runAction
+                            }
+                            val param = ZCodeCaptchaGate.requestPrefetch(config)
+                            if (param != null) {
+                                ZCodeCaptchaGate.cachePrefetchedParam(param)
+                                prefetchStatus = "已预取验证（45 秒内有效，下次验证不再弹窗）。"
+                            } else {
+                                prefetchStatus = "预取未完成（已取消或无验证弹窗）。"
+                            }
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = busy == null,
+                ) { Text(if (busy == "预取验证") "预取中…" else "预取验证") }
 
                 if (statusLine != null) {
                     Spacer(Modifier.height(8.dp))
                     Text(statusLine!!, style = MaterialTheme.typography.bodyMedium)
+                }
+                if (prefetchStatus != null) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(prefetchStatus!!, style = MaterialTheme.typography.bodyMedium)
                 }
 
                 val balanceLines = balanceResult?.let { parseBalanceSummary(it.body) }.orEmpty()
@@ -362,20 +477,41 @@ fun ColumnScope.ZCodeConsoleSection(
                                     "${grant.name.ifEmpty { "额度" }} ${grant.units}"
                                 })
                             }
+                            if (plan.source == ZCodeActivation.ClaimablePlan.Source.FALLBACK) {
+                                append(" · 兑底 id，未验证是否有效")
+                            }
                         }
                         SettingsRow(
                             title = plan.name,
                             subtitle = subtitle,
-                            onClick = { selectedPlanId = plan.id },
+                            onClick = { selectedPlan = plan },
                             showDivider = false,
                         )
-                        if (selectedPlanId == plan.id) {
+                        if (selectedPlan?.id == plan.id) {
                             Text("已选中", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
                         }
                     }
-                } else if (previewResult != null) {
+                    // #20: which categories look missing, from current.
+                    val missing = currentResult?.let {
+                        ZCodeActivation.classifyMissingCategories(it.body)
+                    }.orEmpty()
+                    if (missing.isNotEmpty()) {
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "提示：当前套餐疑似缺 " + missing.joinToString("、") {
+                                if (it == "weekend") "周末包" else "每日包"
+                            } + "（按 current 的计划 id 启发式判断，仅供参考）。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                } else if (previewResult != null || touchResult != null) {
                     Spacer(Modifier.height(8.dp))
                     Text("当前没有可领的计划。", style = MaterialTheme.typography.bodyMedium)
+                }
+                if (crossCheck != null) {
+                    Spacer(Modifier.height(8.dp))
+                    Text("交叉验证：${crossCheck!!.summary}", style = MaterialTheme.typography.bodyMedium)
                 }
                 if (claimResult != null) {
                     Spacer(Modifier.height(8.dp))

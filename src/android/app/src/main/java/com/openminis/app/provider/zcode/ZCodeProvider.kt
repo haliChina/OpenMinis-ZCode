@@ -135,6 +135,7 @@ class ZCodeProvider(
         thinkingLevel: ThinkingLevel,
     ): LLMResponse = withContext(Dispatchers.IO) {
         semaphoreFor(instanceId).withPermit {
+            requireVisionIfImages(messages, imageParts)
             val jwt = jwtProvider()
                 ?: throw LLMError.InvalidApiKey("未登录 ZCode，登录已过期请重新登录。")
             val body = buildRequestBody(messages, systemPrompt, maxTokens, stream = false, temperature, imageParts, tools, ZCodeOAuthManager.jwtUserId(jwt))
@@ -171,6 +172,7 @@ class ZCodeProvider(
         val semaphore = semaphoreFor(instanceId)
         semaphore.acquire()
         try {
+            requireVisionIfImages(messages, imageParts)
             val jwt = jwtProvider()
                 ?: throw LLMError.InvalidApiKey("未登录 ZCode，登录已过期请重新登录。")
             val body = buildRequestBody(messages, systemPrompt, maxTokens, stream = true, temperature, imageParts, tools, ZCodeOAuthManager.jwtUserId(jwt))
@@ -275,10 +277,41 @@ class ZCodeProvider(
     // ── Request execution + one manual-captcha retry ───────────────────
 
     /**
+     * #24: only GLM-5.3-Flash has vision (official builtin config
+     * revision 43: `.*glm-5.3.*` supportsImage false,
+     * `.*glm-5.3-flash.*` supportsImage true; GLM-5.2 and GLM-5-Turbo
+     * are false too). An image request on any other model is rejected
+     * locally with a pointer to Flash, instead of burning a captcha
+     * param on a request upstream will refuse. Images are this turn's
+     * attachments, history image blocks, and tool results carrying
+     * image data.
+     */
+    private fun requireVisionIfImages(
+        messages: List<LLMMessage>,
+        imageParts: List<LLMMessage.ImagePart>,
+    ) {
+        if (ZCodeConstants.supportsVision(model.id)) return
+        val hasImage = imageParts.isNotEmpty() || messages.any { msg ->
+            msg.contentParts.any { part ->
+                part is AgentContentPart.ImageData ||
+                    (part is AgentContentPart.ToolResult && part.imageData != null)
+            }
+        }
+        if (hasImage) {
+            throw LLMError.ProviderError(
+                "模型 ${model.id} 不支持图片输入，带图片的请求请改用 GLM-5.3-Flash。",
+            )
+        }
+    }
+
+    /**
      * Execute the chat request once; on a captcha challenge, ask the user
      * once through the gate and retry the SAME request once with the param.
      * Returns the (possibly retried) response — the caller still checks
      * isSuccessful and maps errors. The caller owns closing the response.
+     * When the live config says model requests skip verification
+     * ([ZCodeCaptchaGate.Config.skipModelRequest], #16), no dialog is
+     * opened — the upstream error stands as-is.
      */
     private suspend fun executeWithCaptchaRetry(jwt: String, bodyStr: String): Response {
         val first = client.newCall(buildRequest(jwt, bodyStr, verifyParam = null, region = null)).execute()
@@ -297,6 +330,7 @@ class ZCodeProvider(
             return first
         }
         val config = runCatching { configProvider() }.getOrDefault(ZCodeCaptchaGate.Config.FALLBACK)
+        if (config.skipModelRequest) return first
         val param = ZCodeCaptchaGate.requestVerification(config)
             ?: return first // user cancelled (or no dialog mounted): original error stands
         first.close()
@@ -313,8 +347,8 @@ class ZCodeProvider(
             .header("content-type", "application/json")
             .header("Authorization", "Bearer $jwt")
             .header("x-api-key", jwt)
-            .header("User-Agent", "ZCode/${ZCodeConstants.CLIENT_APP_VERSION}")
-            .header("X-ZCode-App-Version", ZCodeConstants.CLIENT_APP_VERSION)
+            .header("User-Agent", "ZCode/${ZCodeConstants.appVersion()}")
+            .header("X-ZCode-App-Version", ZCodeConstants.appVersion())
             .header("X-ZCode-Agent", "glm")
             .header("HTTP-Referer", "https://zcode.z.ai")
             .header("X-Title", "Z Code@electron")
@@ -351,7 +385,9 @@ class ZCodeProvider(
         userId: String? = null,
     ): JSONObject {
         val body = JSONObject()
-        body.put("model", model.id)
+        // #22: upstream receives the model id lowercase
+        // (a137460387 zcode-plan.js:16 lowercases body.model).
+        body.put("model", ZCodeConstants.wireModelId(model.id))
         val ceiling = model.maxOutputTokens ?: 128_000
         body.put("max_tokens", maxTokens.coerceIn(1, ceiling))
         body.put("stream", stream)

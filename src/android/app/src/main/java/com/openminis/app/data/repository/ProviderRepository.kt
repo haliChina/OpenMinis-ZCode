@@ -2865,12 +2865,22 @@ class ProviderRepository(private val context: Context) {
                     // the stored plan mode (Start Plan has no GLM-5.3).
                     // Never falls through to models.dev: z.ai is not in its
                     // registry, and a wrong-vendor list would offer models
-                    // this account cannot use.
+                    // this account cannot use. #14: when a balance read has
+                    // produced capability-derived model ids, those win —
+                    // upstream may add or adjust models without a release;
+                    // the static plan list is only the fallback.
                     ProviderType.zcode -> {
-                        val mode = if (context != null) {
-                            com.openminis.app.auth.ZCodeOAuthManager(context, instance.id).planMode()
-                        } else com.openminis.app.auth.ZCodeConstants.PlanMode.UNKNOWN
-                        com.openminis.app.auth.ZCodeConstants.modelsForPlan(mode)
+                        val manager = if (context != null) {
+                            com.openminis.app.auth.ZCodeOAuthManager(context, instance.id)
+                        } else null
+                        val balanceIds = manager?.balanceModelIds().orEmpty()
+                        if (balanceIds.isNotEmpty()) {
+                            com.openminis.app.auth.ZCodeConstants.modelsForIds(balanceIds)
+                        } else {
+                            val mode = manager?.planMode()
+                                ?: com.openminis.app.auth.ZCodeConstants.PlanMode.UNKNOWN
+                            com.openminis.app.auth.ZCodeConstants.modelsForPlan(mode)
+                        }
                     }
                     // [T-android-provider-type-parity] No models endpoint to
                     // query for a type this build cannot drive; the instance

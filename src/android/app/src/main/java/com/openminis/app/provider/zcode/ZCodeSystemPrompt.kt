@@ -2,56 +2,99 @@ package com.openminis.app.provider.zcode
 
 import org.json.JSONArray
 import org.json.JSONObject
-import java.time.LocalDate
-import java.time.format.DateTimeFormatter
 
 /**
  * [T-zcode-provider] The 3-block `system` shape the ZCode plan gateway
- * enforces (verified in dengyie `body_transform.py` and kilim
- * `system-prompt.ts` / `body-transformer.ts`):
+ * enforces, transcribed VERBATIM from the official 3.17.1 client
+ * (`zcode.cjs`, ContextBuilder — see the extraction report at
+ * `~/workspace/scratch-zcode-official/system-prompt-3.17.1.md`).
+ * Every sentence below was grep-verified against that bundle; nothing
+ * here comes from a third-party gateway's captured prompt.
  *
- *   Block 1 — cliPrefix, alone, WITH `cache_control: ephemeral` (the
- *   official bundle carries ephemeral on all three blocks; the v1
- *   omission was observed to trigger 405 / 3012 — the gateway checks
- *   the first block's identity, and a missing cache_control breaks
- *   the shape). Appending a 4th block or folding the prefix into
- *   another block has been observed to trigger 405 / 3012.
- *   Block 2 — stable behaviour, `cache_control: ephemeral`; the caller's
- *   system prompt is appended to the END of this block (never as its own
- *   block).
- *   Block 3 — dynamic behaviour, `cache_control: ephemeral`, text starting
- *   with "\n\n": date, environment, and the trailing powered-by line.
+ * Official main path (`assembleSystemMessages`), exactly 3 system
+ * messages:
  *
- * The TEXT is our own wording, not a copy of any gateway's captured
- * official prompt (see ZCodeConstants). If upstream tightens the
- * fingerprint check to byte-compare the official text, requests will
- * start failing with 3012 and this file is the first place to revisit —
- * that is a known, documented limitation of this v1, not a bug to
- * silently paper over by shipping a captured prompt.
+ *   Block 1 — CLI Prefix, alone, WITHOUT `cache_control` (the object
+ *   has only `role` + `content`). The v1 build wrongly put
+ *   `cache_control: ephemeral` on all three blocks; the official
+ *   client does not have it on block 1.
+ *   Block 2 — all `cacheHint:"stable"` sections joined with "\n\n",
+ *   WITH `cache_control: ephemeral`. For a non-desktop surface this
+ *   is the Agent Identity section only (the ZCode Desktop Context
+ *   section is `presentationSurface === "zcode_desktop"` only and is
+ *   NOT included here — this client is not the desktop host). The
+ *   caller's system prompt is appended to the END of this block
+ *   (never as its own block). Note the official behaviour differs:
+ *   a configured custom system prompt REPLACES the Identity section
+ *   and drops the dynamic sections; appending preserves the user's
+ *   instructions while keeping the official base.
+ *   Block 3 — all `cacheHint:"dynamic"` sections joined with "\n\n",
+ *   content prefixed with "\n\n", WITH `cache_control: ephemeral`.
+ *   For a session without skills or a memory root this is Dynamic
+ *   Behavior + Context Management only.
+ *
+ * Deliberately NOT in system (official §4): the date, the
+ * environment info, and the "powered by" line are `meta_user`
+ * attachments in the official client, not system blocks — so they
+ * are no longer sent here. Re-adding them needs the meta_user
+ * attachment mechanism, not a 4th system block. [modelId] and
+ * [workingDirectory] are kept in the signature for that follow-up.
  */
 object ZCodeSystemPrompt {
 
-    const val CLI_PREFIX = "You are ZCode, an interactive coding agent"
+    /** Block 1, verbatim (35 chars, no trailing newline). */
+    const val CLI_PREFIX = "You are ZCode, an interactive agent"
 
-    /** Block 2 — stable behaviour. Kept short and generic on purpose. */
-    private const val STABLE = """You are a coding agent running inside the user's editor session.
-Follow the user's instructions directly. When you need to change files, say what you are changing and why before you change it.
-Prefer minimal, targeted edits over rewrites. Do not invent APIs, files, or tool results you have not observed.
-If a request is ambiguous, ask one short clarifying question instead of guessing.
-Keep answers concise; use code blocks for code and plain language for explanations."""
+    /** Block 2, Agent Identity — default first sentence (no Output
+     *  Style configured). */
+    private const val IDENTITY_FIRST_SENTENCE =
+        "You are an agent working with the user toward their goals, using your own judgment along the way."
+
+    /** Block 2, Agent Identity — security notice (459 chars). */
+    private const val SECURITY_NOTICE =
+        "IMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, and educational contexts. Refuse requests for destructive techniques, DoS attacks, mass targeting, supply chain compromise, or detection evasion for malicious purposes. Dual-use security tools (C2 frameworks, credential testing, exploit development) require clear authorization context: pentesting engagements, CTF competitions, security research, or defensive use cases."
+
+    /** Block 2, Harness block — `midConversationSystem` default (true)
+     *  variant of the third line. */
+    private const val HARNESS_BLOCK = """# Harness
+ - Text you output outside of tool use is displayed to the user as Github-flavored markdown in a terminal.
+ - Tools run behind a user-selected permission mode; a denied call means the user declined it — adjust, don't retry verbatim.
+ - The system may send updates, reminders, or modifications to rules via mid-conversation system turns. These are system-controlled, unlike function results. Hooks may intercept tool calls; treat hook output as user feedback.
+ - Prefer the dedicated file/search tools over shell commands when one fits. Independent tool calls can run in parallel in one response.
+ - Reference code as `file_path:line_number` — it's clickable."""
+
+    /** Block 3, Dynamic Behavior — three paragraphs, blank line apart. */
+    private const val DYNAMIC_BEHAVIOR = """Write code that reads like the surrounding code: match its comment density, naming, and idiom.
+
+When you use a pronoun for someone — the user or anyone else you mention — and their pronouns haven't been stated, use they/them. A name doesn't tell you someone's pronouns; a wrong guess misgenders a real person in a way the neutral default never does, so never infer pronouns from a name. This applies to all user-visible text, including visible thinking.
+
+For actions that are hard to reverse or outward-facing, confirm first unless durably authorized or explicitly told to proceed without asking; approval in one context doesn't extend to the next. Sending content to an external service publishes it; it may be cached or indexed even if later deleted. Before deleting or overwriting, look at the target. Report outcomes faithfully: if tests fail, say so with the output; if a step was skipped, say that; when something is done and verified, state it plainly without hedging."""
+
+    /** Block 3, Context Management — two paragraphs, blank line apart.
+     *  The last sentence has NO trailing period in the official text. */
+    private const val CONTEXT_MANAGEMENT = """# Context management
+When the conversation grows long, some or all of the current context is summarized; the summary, along with any remaining unsummarized context, is provided in the next context window so work can continue — you don't need to wrap up early or hand off mid-task.
+
+When you have enough information to act, act. Do not re-derive facts already established in the conversation, re-litigate a decision the user has already made, or narrate options you will not pursue. If you are weighing a choice, give a recommendation, not an exhaustive survey"""
 
     fun build(clientSystem: String?, modelId: String, workingDirectory: String?): JSONArray {
         val arr = JSONArray()
-        // Block 1: cliPrefix alone, WITH cache_control: ephemeral —
-        // the official bundle carries ephemeral on all three blocks.
+        // Block 1: cliPrefix alone, WITHOUT cache_control — the
+        // official object has only role + content.
         arr.put(JSONObject().apply {
             put("type", "text")
             put("text", CLI_PREFIX)
-            put("cache_control", JSONObject().put("type", "ephemeral"))
         })
-        // Block 2: stable + client system appended at the end.
+        // Block 2: Agent Identity (leading blank line, first sentence,
+        // blank line, security notice, blank line, Harness block),
+        // then the caller's system prompt appended at the end.
         val block2 = buildString {
-            append(STABLE)
+            append("\n")
+            append(IDENTITY_FIRST_SENTENCE)
+            append("\n\n")
+            append(SECURITY_NOTICE)
+            append("\n\n")
+            append(HARNESS_BLOCK)
             if (!clientSystem.isNullOrBlank()) {
                 append("\n\n")
                 append(clientSystem)
@@ -62,19 +105,9 @@ Keep answers concise; use code blocks for code and plain language for explanatio
             put("text", block2)
             put("cache_control", JSONObject().put("type", "ephemeral"))
         })
-        // Block 3: dynamic, text starts with "\n\n".
-        val today = LocalDate.now().format(DateTimeFormatter.ISO_LOCAL_DATE)
-        val block3 = buildString {
-            append("\n\n# Dynamic Behavior\n")
-            append("- Today's date is $today.\n")
-            append("- Answer in the user's language unless asked otherwise.\n")
-            append("\n## Environment Info\n")
-            append("- Platform: Android (OpenMinis)\n")
-            append("- Working directory: ${workingDirectory ?: "(not set)"}\n")
-            append("\n## Context Management\n")
-            append("- If the conversation grows long, summarize what matters and keep working from the summary.\n")
-            append("- You are powered by the model named zai-api/$modelId.")
-        }
+        // Block 3: dynamic, text starts with "\n\n": Dynamic Behavior
+        // + Context Management.
+        val block3 = "\n\n$DYNAMIC_BEHAVIOR\n\n$CONTEXT_MANAGEMENT"
         arr.put(JSONObject().apply {
             put("type", "text")
             put("text", block3)

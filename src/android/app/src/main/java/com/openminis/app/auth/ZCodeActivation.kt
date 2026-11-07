@@ -48,8 +48,11 @@ object ZCodeActivation {
         val priority: Int = 0,
         val grants: List<Grant> = emptyList(),
         val source: Source = Source.PREVIEW,
+        /** Campaign the plan came from (touch deliveries only) — needed
+         *  for the post-claim confirm receipt (#7). Empty when unknown. */
+        val campaignId: String = "",
     ) {
-        enum class Source { PREVIEW, TOUCH }
+        enum class Source { PREVIEW, TOUCH, FALLBACK }
     }
 
     /** One token grant inside a plan's entitlements. */
@@ -63,7 +66,8 @@ object ZCodeActivation {
      * One activation event body — exactly the 16 fields the official
      * client sends (gateway `claim.py` / event report). [elementName] is
      * one of [ACTIVATION_ELEMENTS]; [screenResolution] is e.g.
-     * "1080x2400"; [appVersion] defaults to [ZCodeConstants.CLIENT_APP_VERSION].
+     * "1080x2400"; [appVersion] defaults to the effective client
+     * version ([ZCodeConstants.appVersion]).
      * `event_extra_detail` is an empty object and `marketing_params` is
      * the literal string "{}" — both are what the gateway sends — except
      * for `app_login_success`, where `event_region` is "app_profile" and
@@ -78,7 +82,7 @@ object ZCodeActivation {
         clientLanguage: String,
         screenResolution: String,
         osVersion: String,
-        appVersion: String = ZCodeConstants.CLIENT_APP_VERSION,
+        appVersion: String = ZCodeConstants.appVersion(),
         loginProvider: String = "zai",
     ): JSONObject = JSONObject().apply {
         // [T-zcode-provider] zcode-pool sends a third event,
@@ -157,8 +161,19 @@ object ZCodeActivation {
         val deliveries = root.optJSONObject("data")?.optJSONArray("deliveries") ?: return emptyList()
         val plans = linkedMapOf<String, ClaimablePlan>()
         val actionIds = mutableListOf<String>()
+        val actionCampaigns = mutableMapOf<String, String>()
         for (i in 0 until deliveries.length()) {
-            scanTouchValue(deliveries.opt(i), plans, actionIds)
+            val delivery = deliveries.optJSONObject(i) ?: continue
+            // The confirm receipt (#7) needs the campaign id: prefer an
+            // explicit campaign_id/campaignId, fall back to the delivery id.
+            val campaignId = delivery.optString("campaign_id", "")
+                .ifEmpty { delivery.optString("campaignId", "") }
+                .ifEmpty { delivery.optString("id", "") }
+            val before = actionIds.size
+            scanTouchValue(delivery, plans, actionIds, campaignId)
+            for (j in before until actionIds.size) {
+                actionCampaigns[actionIds[j]] = campaignId
+            }
         }
         for (id in actionIds) {
             if (!plans.containsKey(id)) {
@@ -168,6 +183,7 @@ object ZCodeActivation {
                     description = "活动投放套餐",
                     priority = 100,
                     source = ClaimablePlan.Source.TOUCH,
+                    campaignId = actionCampaigns[id].orEmpty(),
                 )
             }
         }
@@ -178,13 +194,14 @@ object ZCodeActivation {
         value: Any?,
         plans: MutableMap<String, ClaimablePlan>,
         actionIds: MutableList<String>,
+        campaignId: String,
     ) {
         when (value) {
             is JSONObject -> {
                 for (key in listOf("zcode_plan", "zcodePlan")) {
                     value.optJSONObject(key)?.let { planObj ->
                         parsePlanObject(planObj, ClaimablePlan.Source.TOUCH)
-                            ?.let { plans.putIfAbsent(it.id, it) }
+                            ?.let { plans.putIfAbsent(it.id, it.copy(campaignId = campaignId)) }
                     }
                 }
                 if (value.optString("type", "") == "claim_zcode_plan") {
@@ -195,12 +212,12 @@ object ZCodeActivation {
                 }
                 val keys = value.keys()
                 while (keys.hasNext()) {
-                    scanTouchValue(value.opt(keys.next()), plans, actionIds)
+                    scanTouchValue(value.opt(keys.next()), plans, actionIds, campaignId)
                 }
             }
             is JSONArray -> {
                 for (i in 0 until value.length()) {
-                    scanTouchValue(value.opt(i), plans, actionIds)
+                    scanTouchValue(value.opt(i), plans, actionIds, campaignId)
                 }
             }
             else -> Unit
@@ -247,18 +264,366 @@ object ZCodeActivation {
     }
 
     /**
-     * Merge preview and touch plans by plan_id — preview wins on a
+     * Merge preview and touch plans by plan_id — touch wins on a
      * duplicate id — then sort by priority descending, plan_id ascending.
+     * Touch is the real claim entry (hj01857655: preview is dead code,
+     * always empty; 7sen1ot: marketing first); preview is only a backup.
      */
     fun mergePlans(
         preview: List<ClaimablePlan>,
         touch: List<ClaimablePlan>,
     ): List<ClaimablePlan> {
         val seen = linkedMapOf<String, ClaimablePlan>()
-        for (plan in preview) seen.putIfAbsent(plan.id, plan)
         for (plan in touch) seen.putIfAbsent(plan.id, plan)
+        for (plan in preview) seen.putIfAbsent(plan.id, plan)
         return seen.values.sortedWith(
             compareByDescending<ClaimablePlan> { it.priority }.thenBy { it.id },
         )
+    }
+
+    // ── Touch claim entry (#5–#7) ───────────────────────────────────────
+
+    /** marketing/touch URL for a seq value (seq increments, see #6). */
+    fun buildTouchUrl(seq: Long): String = "marketing/touch?seq=$seq"
+
+    /** Post-claim confirm receipt body (hj01857655 claim.go:601-616):
+     *  `{"campaign_id":…, "action_type":"confirm"}`. */
+    fun buildTouchConfirmBody(campaignId: String): JSONObject =
+        JSONObject().apply {
+            put("campaign_id", campaignId)
+            put("action_type", "confirm")
+        }
+
+    // ── Claim outcome (#8, #10) ─────────────────────────────────────────
+
+    /**
+     * A claim really succeeded only when code == 0 AND `data.plan` is a
+     * non-empty object (7sen1ot claims.go:323, angusdevgo
+     * zcgw-server.mjs:1569-1572: code 0 with an empty plan is a failure).
+     */
+    fun claimSucceeded(code: Int?, body: String): Boolean {
+        if (code != 0) return false
+        val plan = runCatching {
+            JSONObject(body).optJSONObject("data")?.optJSONObject("plan")
+        }.getOrNull() ?: return false
+        return plan.length() > 0
+    }
+
+    /** Next claimable time from a 1005 response: `data.plan.ends_at`,
+     *  verbatim (pjpv claim.rs:70-76). Null when absent. */
+    fun parseClaimNextAvailableAt(body: String): String? {
+        val endsAt = runCatching {
+            JSONObject(body).optJSONObject("data")
+                ?.optJSONObject("plan")?.optString("ends_at", "")
+        }.getOrNull().orEmpty()
+        return endsAt.ifEmpty { null }
+    }
+
+    // ── 1005 circuit breaker (#9) ──────────────────────────────────────
+
+    /**
+     * Per-plan 1005 tracker: 3 consecutive 1005s on the same plan block
+     * it for 30 minutes (a137460387 accounts.js:187-220). Pure state
+     * machine — the manager persists the map (plan id → state) as JSON.
+     * A success (or a 1003 "already claimed") resets the count.
+     */
+    object ClaimCircuit {
+        const val MAX_CONSECUTIVE_1005 = 3
+        const val BLOCK_MS = 30 * 60 * 1000L
+
+        data class State(val consecutive1005: Int = 0, val blockedUntilMs: Long = 0)
+
+        fun record1005(state: State, nowMs: Long): State {
+            val count = state.consecutive1005 + 1
+            return if (count >= MAX_CONSECUTIVE_1005) {
+                State(count, nowMs + BLOCK_MS)
+            } else {
+                State(count, state.blockedUntilMs)
+            }
+        }
+
+        fun recordSuccess(): State = State(0, 0)
+
+        fun isBlocked(state: State, nowMs: Long): Boolean =
+            state.blockedUntilMs > nowMs
+
+        fun serialize(states: Map<String, State>): String {
+            val obj = JSONObject()
+            for ((planId, st) in states) {
+                obj.put(planId, JSONObject().apply {
+                    put("n", st.consecutive1005)
+                    put("until", st.blockedUntilMs)
+                })
+            }
+            return obj.toString()
+        }
+
+        fun deserialize(raw: String): Map<String, State> {
+            val out = linkedMapOf<String, State>()
+            val obj = runCatching { JSONObject(raw) }.getOrNull() ?: return out
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                val planId = keys.next()
+                val st = obj.optJSONObject(planId) ?: continue
+                out[planId] = State(
+                    consecutive1005 = st.optInt("n", 0),
+                    blockedUntilMs = st.optLong("until", 0),
+                )
+            }
+            return out
+        }
+    }
+
+    // ── Daily claim ledger (#11) ───────────────────────────────────────
+
+    /**
+     * Same-day claim ledger: after a claim returns 0 or 1003, the
+     * (account, plan) pair is recorded for the day (hj01857655
+     * claim.go:322-383). The day is the Asia/Shanghai calendar date, so
+     * the ledger follows the server's day boundary. Pure helpers — the
+     * manager persists the entry set as a JSON array string.
+     */
+    object ClaimLedger {
+        fun todayCst(nowMs: Long): String =
+            java.time.Instant.ofEpochMilli(nowMs)
+                .atZone(java.time.ZoneId.of("Asia/Shanghai"))
+                .toLocalDate().toString()
+
+        fun entryKey(userId: String, planId: String, dayCst: String): String =
+            "$userId|$planId|$dayCst"
+
+        fun serialize(entries: Set<String>): String {
+            val arr = JSONArray()
+            for (e in entries) arr.put(e)
+            return arr.toString()
+        }
+
+        fun deserialize(raw: String): Set<String> {
+            val out = linkedSetOf<String>()
+            val arr = runCatching { JSONArray(raw) }.getOrNull() ?: return out
+            for (i in 0 until arr.length()) {
+                arr.optString(i, "").takeIf { it.isNotEmpty() }?.let { out.add(it) }
+            }
+            return out
+        }
+    }
+
+    // ── Preview-empty cross-check (#13) ────────────────────────────────
+
+    /** What billing/current + billing/balance say about the account,
+     *  used when preview comes back empty: distinguishes "no plan at
+     *  all" from "has a plan but nothing claimable" (liu5269
+     *  app/quota.py:61-89). */
+    data class CrossCheck(
+        val hasPlan: Boolean,
+        val hasBalance: Boolean,
+        val summary: String,
+    )
+
+    fun crossCheckPlan(balanceBody: String, currentBody: String): CrossCheck {
+        val plans = runCatching {
+            JSONObject(currentBody).optJSONObject("data")?.optJSONArray("plans")
+        }.getOrNull()
+        val hasPlan = (plans?.length() ?: 0) > 0
+        var hasBalance = false
+        val balances = runCatching {
+            JSONObject(balanceBody).optJSONObject("data")?.optJSONArray("balances")
+        }.getOrNull()
+        if (balances != null) {
+            for (i in 0 until balances.length()) {
+                val b = balances.optJSONObject(i) ?: continue
+                if (b.optLong("remaining_units", 0) > 0) {
+                    hasBalance = true
+                    break
+                }
+            }
+        }
+        val summary = when {
+            !hasPlan && !hasBalance -> "账号无套餐、无余额（current 与 balance 均为空）"
+            !hasPlan -> "current 无套餐，但 balance 仍有余额"
+            !hasBalance -> "账号有套餐，但 balance 余额为 0"
+            else -> "账号有套餐且有余额，只是当前没有可领计划"
+        }
+        return CrossCheck(hasPlan, hasBalance, summary)
+    }
+
+    // ── Balance-derived models (#14) ───────────────────────────────────
+
+    /**
+     * Model ids from a billing/balance body: `data.balances[]` entries
+     * carry `capabilities` ("model:GLM-5.3-Flash", …) and/or a `model`
+     * field. "model:" prefixes and "[1m]"/"[200k]" context suffixes
+     * (7sen1ot gateway.go:119-151, request.go:8) are stripped, and ids
+     * are normalized to the canonical spelling. Unknown ids are dropped.
+     */
+    fun parseBalanceModelIds(balanceBody: String): List<String> {
+        val out = linkedSetOf<String>()
+        val balances = runCatching {
+            JSONObject(balanceBody).optJSONObject("data")?.optJSONArray("balances")
+        }.getOrNull() ?: return emptyList()
+        for (i in 0 until balances.length()) {
+            val b = balances.optJSONObject(i) ?: continue
+            fun add(raw: String) {
+                var id = raw.trim()
+                    .removePrefix("model:")
+                    .removeSuffix("[1m]").removeSuffix("[200k]")
+                    .trim()
+                if (id.isEmpty()) return
+                ZCodeConstants.normalizeModelId(id)?.let { out.add(it) }
+            }
+            b.optString("model", "").takeIf { it.isNotEmpty() }?.let { add(it) }
+            when (val caps = b.opt("capabilities")) {
+                is JSONArray -> for (j in 0 until caps.length()) {
+                    caps.optString(j, "").takeIf { it.isNotEmpty() }?.let { add(it) }
+                }
+                is JSONObject -> {
+                    val keys = caps.keys()
+                    while (keys.hasNext()) add(keys.next())
+                }
+            }
+        }
+        return out.toList()
+    }
+
+    // ── Date-coded fallback plan ids (#20) ─────────────────────────────
+
+    /**
+     * Fallback claimable ids when preview AND touch are both empty
+     * (angusdevgo zcgw-server.mjs:1470-1535). The daily package has a
+     * fixed id; the weekend package is date-coded `zcode-v3-start-plan-
+     * {MMDD}-wk`, generated for yesterday/today/tomorrow (Beijing time)
+     * because the server's day boundary is not guaranteed to match the
+     * phone's. These ids are the author's empirical values — they are
+     * offered only as selectable fallback entries, never auto-claimed,
+     * and the console marks them "兑底（待实测）".
+     */
+    fun buildDateCodedFallbackIds(todayCst: java.time.LocalDate): List<String> {
+        val out = mutableListOf<String>()
+        out.add("zcode-v3-start-plan-0817")
+        for (delta in listOf(-1L, 0L, 1L)) {
+            val mmdd = todayCst.plusDays(delta)
+                .format(java.time.format.DateTimeFormatter.ofPattern("MMdd"))
+            out.add("zcode-v3-start-plan-$mmdd-wk")
+        }
+        return out
+    }
+
+    /**
+     * Which package categories look missing from a billing/current
+     * body — heuristic only: a weekend ("-wk") plan id and a daily
+     * plan id are looked for among the current plans. Used as a display
+     * hint next to the claimable list, never as an auto-claim trigger.
+     */
+    fun classifyMissingCategories(currentBody: String): Set<String> {
+        val ids = mutableListOf<String>()
+        val plans = runCatching {
+            JSONObject(currentBody).optJSONObject("data")?.optJSONArray("plans")
+        }.getOrNull()
+        if (plans != null) {
+            for (i in 0 until plans.length()) {
+                plans.optJSONObject(i)?.optString("plan_id", "")
+                    ?.takeIf { it.isNotEmpty() }?.let { ids.add(it) }
+            }
+        }
+        val missing = mutableSetOf<String>()
+        if (ids.none { "-wk" in it }) missing.add("weekend")
+        if (ids.none { "0817" in it || "daily" in it.lowercase() }) missing.add("daily")
+        return missing
+    }
+
+    // ── Balance detail (#25) ───────────────────────────────────────────
+
+    /** One quota bucket from billing/balance, with full fields. */
+    data class BalanceBucket(
+        val name: String,
+        val remaining: Long,
+        val total: Long,
+        val used: Long,
+        val period: String,
+        val expiresAt: String,
+        val capabilities: List<String>,
+    ) {
+        /** "daily" → 每日重置；anything else shown verbatim. */
+        val periodLabel: String get() = when (period.lowercase()) {
+            "daily" -> "每日重置"
+            "" -> ""
+            else -> period
+        }
+    }
+
+    /** One plan from billing/current, with full fields. */
+    data class BalancePlan(
+        val id: String,
+        val name: String,
+        val period: String,
+        val expiresAt: String,
+        val capabilities: List<String>,
+    )
+
+    data class BalanceDetail(
+        val plans: List<BalancePlan>,
+        val buckets: List<BalanceBucket>,
+    )
+
+    /** Parse plans[] + balances[] with all fields (hj01857655
+     *  accounts.go:315-424): capabilities, period, expires_at — so the
+     *  console can tell the GLM-5.3-Flash bucket apart from the GLM-5.3
+     *  bucket and say when a bucket resets. Never throws. */
+    fun parseBalanceDetail(body: String): BalanceDetail {
+        val data = runCatching { JSONObject(body).optJSONObject("data") }.getOrNull()
+            ?: return BalanceDetail(emptyList(), emptyList())
+        fun capsOf(obj: JSONObject): List<String> {
+            val out = mutableListOf<String>()
+            when (val caps = obj.opt("capabilities")) {
+                is JSONArray -> for (j in 0 until caps.length()) {
+                    caps.optString(j, "").takeIf { it.isNotEmpty() }?.let { out.add(it) }
+                }
+                is JSONObject -> {
+                    val keys = caps.keys()
+                    while (keys.hasNext()) out.add(keys.next())
+                }
+            }
+            return out
+        }
+        val plans = mutableListOf<BalancePlan>()
+        data.optJSONArray("plans")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val p = arr.optJSONObject(i) ?: continue
+                val id = p.optString("plan_id", "").ifEmpty { p.optString("planId", "") }
+                if (id.isEmpty()) continue
+                plans.add(
+                    BalancePlan(
+                        id = id,
+                        name = p.optString("show_name", "")
+                            .ifEmpty { p.optString("showName", "") }
+                            .ifEmpty { p.optString("name", "") }
+                            .ifEmpty { id },
+                        period = p.optString("period", ""),
+                        expiresAt = p.optString("expires_at", "")
+                            .ifEmpty { p.optString("expiresAt", "") },
+                        capabilities = capsOf(p),
+                    ),
+                )
+            }
+        }
+        val buckets = mutableListOf<BalanceBucket>()
+        data.optJSONArray("balances")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val b = arr.optJSONObject(i) ?: continue
+                buckets.add(
+                    BalanceBucket(
+                        name = b.optString("show_name", "").ifEmpty { b.optString("model", "") },
+                        remaining = b.optLong("remaining_units", -1),
+                        total = b.optLong("total_units", -1),
+                        used = b.optLong("used_units", -1),
+                        period = b.optString("period", ""),
+                        expiresAt = b.optString("expires_at", "")
+                            .ifEmpty { b.optString("expiresAt", "") },
+                        capabilities = capsOf(b),
+                    ),
+                )
+            }
+        }
+        return BalanceDetail(plans, buckets)
     }
 }

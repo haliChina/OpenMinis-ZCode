@@ -133,24 +133,38 @@ class ZCodeProviderTest {
         )
         assertEquals(3, system.length())
         val block1 = system.getJSONObject(0)
-        assertEquals("You are ZCode, an interactive coding agent", block1.getString("text"))
-        // Block 1 carries cache_control: ephemeral like the official
-        // bundle (all three blocks); the v1 omission triggered 405/3012.
-        assertTrue(block1.has("cache_control"))
-        assertEquals(
-            "ephemeral",
-            block1.getJSONObject("cache_control").getString("type"),
-        )
+        // Official 3.17.1 block 1: the prefix alone, WITHOUT
+        // cache_control (the official object has only role + content).
+        assertEquals("You are ZCode, an interactive agent", block1.getString("text"))
+        assertFalse(block1.has("cache_control"))
         val block2 = system.getJSONObject(1)
         assertTrue(block2.has("cache_control"))
-        assertTrue(block2.getString("text").contains("Be terse."))
+        assertEquals(
+            "ephemeral",
+            block2.getJSONObject("cache_control").getString("type"),
+        )
+        // Official Agent Identity: first sentence, security notice,
+        // Harness block; the caller's prompt is appended at the end.
+        val text2 = block2.getString("text")
+        assertTrue(text2.startsWith("\n"))
+        assertTrue(
+            text2.contains(
+                "You are an agent working with the user toward their goals, using your own judgment along the way.",
+            ),
+        )
+        assertTrue(text2.contains("Dual-use security tools"))
+        assertTrue(text2.contains("# Harness"))
+        assertTrue(text2.contains("Be terse."))
         val block3 = system.getJSONObject(2)
         assertTrue(block3.has("cache_control"))
         assertTrue(block3.getString("text").startsWith("\n\n"))
-        assertTrue(
-            block3.getString("text")
-                .contains("You are powered by the model named zai-api/GLM-5.3-Flash."),
-        )
+        // Official dynamic sections only: date, environment and the
+        // "powered by" line are meta_user attachments, not system.
+        val text3 = block3.getString("text")
+        assertTrue(text3.contains("match its comment density, naming, and idiom."))
+        assertTrue(text3.contains("# Context management"))
+        assertFalse(text3.contains("Today's date is"))
+        assertFalse(text3.contains("You are powered by the model named"))
     }
 
     // ── BigModel login ───────────────────────────────────────────────
@@ -600,7 +614,7 @@ class ZCodeProviderTest {
     // ── Merge ──────────────────────────────────────────────────────────
 
     @Test
-    fun `merge dedupes by plan id with preview winning and sorts by priority`() {
+    fun `merge dedupes by plan id with touch winning and sorts by priority`() {
         val preview = listOf(
             ZCodeActivation.ClaimablePlan("b", "Preview B", priority = 0),
             ZCodeActivation.ClaimablePlan("a", "Preview A", priority = 5),
@@ -616,7 +630,350 @@ class ZCodeProviderTest {
             ),
         )
         val merged = ZCodeActivation.mergePlans(preview, touch)
-        assertEquals(listOf("a", "c", "b"), merged.map { it.id })
-        assertEquals("Preview B", merged.first { it.id == "b" }.name)
+        assertEquals(listOf("b", "a", "c"), merged.map { it.id })
+        assertEquals("Touch B", merged.first { it.id == "b" }.name)
+    }
+
+    // ── Touch seq + confirm (#6, #7) ───────────────────────────────────
+
+    @Test
+    fun `touch url carries the seq`() {
+        assertEquals("marketing/touch?seq=0", ZCodeActivation.buildTouchUrl(0))
+        assertEquals("marketing/touch?seq=7", ZCodeActivation.buildTouchUrl(7))
+        assertEquals(
+            "https://zcode.z.ai/api/v1/marketing/touch?seq=3",
+            ZCodeConstants.touchUrl(3),
+        )
+    }
+
+    @Test
+    fun `touch seq increments on every call`() {
+        val first = ZCodeOAuthManager.nextTouchSeq()
+        val second = ZCodeOAuthManager.nextTouchSeq()
+        assertEquals(first + 1, second)
+    }
+
+    @Test
+    fun `touch confirm body carries campaign id and confirm action`() {
+        val body = ZCodeActivation.buildTouchConfirmBody("camp-9")
+        assertEquals("camp-9", body.getString("campaign_id"))
+        assertEquals("confirm", body.getString("action_type"))
+    }
+
+    @Test
+    fun `touch deliveries carry the campaign id`() {
+        val body = """{"code":0,"data":{"deliveries":[
+            {"campaign_id":"camp-1","content":{"zcode_plan":{"plan_id":"p1","show_name":"P1"}}},
+            {"campaign_id":"camp-2","actions":[{"type":"claim_zcode_plan","args":{"plan_id":"p2"}}]}
+        ]}}"""
+        val plans = ZCodeActivation.parseTouchDeliveries(body)
+        assertEquals("camp-1", plans.first { it.id == "p1" }.campaignId)
+        assertEquals("camp-2", plans.first { it.id == "p2" }.campaignId)
+    }
+
+    // ── Claim outcome (#8, #10) ───────────────────────────────────────
+
+    @Test
+    fun `claim succeeds only when code is 0 and data plan is non-empty`() {
+        assertTrue(
+            ZCodeActivation.claimSucceeded(
+                0, """{"code":0,"data":{"plan":{"plan_id":"p1"}}}""",
+            ),
+        )
+        assertFalse(
+            ZCodeActivation.claimSucceeded(0, """{"code":0,"data":{"plan":{}}}"""),
+        )
+        assertFalse(
+            ZCodeActivation.claimSucceeded(0, """{"code":0,"data":{}}"""),
+        )
+        assertFalse(
+            ZCodeActivation.claimSucceeded(1005, """{"code":1005,"data":{"plan":{"plan_id":"p1"}}}"""),
+        )
+        assertFalse(ZCodeActivation.claimSucceeded(null, """{"code":0}"""))
+    }
+
+    @Test
+    fun `claim 1005 next available time comes from data plan ends_at`() {
+        assertEquals(
+            "2026-11-08T00:00:00Z",
+            ZCodeActivation.parseClaimNextAvailableAt(
+                """{"code":1005,"data":{"plan":{"plan_id":"p1","ends_at":"2026-11-08T00:00:00Z"}}}""",
+            ),
+        )
+        assertEquals(
+            null,
+            ZCodeActivation.parseClaimNextAvailableAt("""{"code":1005,"data":{}}"""),
+        )
+    }
+
+    // ── 1005 circuit breaker (#9) ──────────────────────────────────────
+
+    @Test
+    fun `circuit blocks after three consecutive 1005s for thirty minutes`() {
+        val now = 1_700_000_000_000L
+        var state = ZCodeActivation.ClaimCircuit.State()
+        assertFalse(ZCodeActivation.ClaimCircuit.isBlocked(state, now))
+        state = ZCodeActivation.ClaimCircuit.record1005(state, now)
+        state = ZCodeActivation.ClaimCircuit.record1005(state, now)
+        assertFalse(ZCodeActivation.ClaimCircuit.isBlocked(state, now))
+        state = ZCodeActivation.ClaimCircuit.record1005(state, now)
+        assertTrue(ZCodeActivation.ClaimCircuit.isBlocked(state, now))
+        assertFalse(
+            ZCodeActivation.ClaimCircuit.isBlocked(
+                state, now + ZCodeActivation.ClaimCircuit.BLOCK_MS + 1,
+            ),
+        )
+        assertEquals(
+            ZCodeActivation.ClaimCircuit.State(),
+            ZCodeActivation.ClaimCircuit.recordSuccess(),
+        )
+    }
+
+    @Test
+    fun `circuit serializes and restores`() {
+        val states = mapOf(
+            "p1" to ZCodeActivation.ClaimCircuit.State(2, 0),
+            "p2" to ZCodeActivation.ClaimCircuit.State(3, 1_700_000_000_000L),
+        )
+        val restored = ZCodeActivation.ClaimCircuit.deserialize(
+            ZCodeActivation.ClaimCircuit.serialize(states),
+        )
+        assertEquals(states, restored)
+        assertTrue(ZCodeActivation.ClaimCircuit.deserialize("not json").isEmpty())
+    }
+
+    // ── Daily claim ledger (#11) ───────────────────────────────────────
+
+    @Test
+    fun `ledger day is the Asia Shanghai calendar date`() {
+        // 2026-11-06T15:59:59Z = 23:59:59 CST; one second later is 11-07.
+        assertEquals(
+            "2026-11-06",
+            ZCodeActivation.ClaimLedger.todayCst(1_793_980_799_000L),
+        )
+        assertEquals(
+            "2026-11-07",
+            ZCodeActivation.ClaimLedger.todayCst(1_793_980_800_000L),
+        )
+        assertEquals(
+            "u1|p1|2026-11-07",
+            ZCodeActivation.ClaimLedger.entryKey("u1", "p1", "2026-11-07"),
+        )
+    }
+
+    @Test
+    fun `ledger serializes and restores`() {
+        val entries = setOf("u1|p1|2026-11-07", "u1|p2|2026-11-06")
+        assertEquals(
+            entries,
+            ZCodeActivation.ClaimLedger.deserialize(
+                ZCodeActivation.ClaimLedger.serialize(entries),
+            ),
+        )
+        assertTrue(ZCodeActivation.ClaimLedger.deserialize("nope").isEmpty())
+    }
+
+    // ── Preview-empty cross-check (#13) ────────────────────────────────
+
+    @Test
+    fun `cross-check distinguishes no plan from has plan no balance`() {
+        val emptyBalance = """{"code":0,"data":{"balances":[]}}"""
+        val emptyCurrent = """{"code":0,"data":{"plans":[]}}"""
+        val noPlan = ZCodeActivation.crossCheckPlan(emptyBalance, emptyCurrent)
+        assertFalse(noPlan.hasPlan)
+        assertFalse(noPlan.hasBalance)
+        val withBalance = """{"code":0,"data":{"balances":[{"remaining_units":100}]}}"""
+        val hasBalance = ZCodeActivation.crossCheckPlan(withBalance, emptyCurrent)
+        assertFalse(hasBalance.hasPlan)
+        assertTrue(hasBalance.hasBalance)
+        val withPlan = """{"code":0,"data":{"plans":[{"plan_id":"p1"}]}}"""
+        val spent = ZCodeActivation.crossCheckPlan(emptyBalance, withPlan)
+        assertTrue(spent.hasPlan)
+        assertFalse(spent.hasBalance)
+        val healthy = ZCodeActivation.crossCheckPlan(withBalance, withPlan)
+        assertTrue(healthy.hasPlan)
+        assertTrue(healthy.hasBalance)
+    }
+
+    // ── Balance-derived models (#14) ───────────────────────────────────
+
+    @Test
+    fun `balance capabilities parse to canonical model ids`() {
+        val body = """{"code":0,"data":{"balances":[
+            {"show_name":"Flash","capabilities":["model:GLM-5.3-Flash","model:GLM-5.2[1m]"]},
+            {"model":"glm-5.3-flash"},
+            {"show_name":"Other","capabilities":["model:FOO"]}
+        ]}}"""
+        assertEquals(
+            listOf("GLM-5.3-Flash", "GLM-5.2"),
+            ZCodeActivation.parseBalanceModelIds(body),
+        )
+        val objectCaps = """{"code":0,"data":{"balances":[
+            {"capabilities":{"model:GLM-5-Turbo":true}}
+        ]}}"""
+        assertEquals(
+            listOf("GLM-5-Turbo"),
+            ZCodeActivation.parseBalanceModelIds(objectCaps),
+        )
+        assertTrue(ZCodeActivation.parseBalanceModelIds("not json").isEmpty())
+    }
+
+    // ── Date-coded fallback ids + missing categories (#20) ─────────────
+
+    @Test
+    fun `date-coded fallback ids cover the daily id and weekend window`() {
+        val ids = ZCodeActivation.buildDateCodedFallbackIds(
+            java.time.LocalDate.of(2026, 11, 7),
+        )
+        assertEquals(
+            listOf(
+                "zcode-v3-start-plan-0817",
+                "zcode-v3-start-plan-1106-wk",
+                "zcode-v3-start-plan-1107-wk",
+                "zcode-v3-start-plan-1108-wk",
+            ),
+            ids,
+        )
+    }
+
+    @Test
+    fun `missing categories are read from current plan ids`() {
+        val daily = """{"code":0,"data":{"plans":[{"plan_id":"zcode-v3-start-plan-0817"}]}}"""
+        assertEquals(setOf("weekend"), ZCodeActivation.classifyMissingCategories(daily))
+        val weekend = """{"code":0,"data":{"plans":[{"plan_id":"zcode-v3-start-plan-1107-wk"}]}}"""
+        assertEquals(setOf("daily"), ZCodeActivation.classifyMissingCategories(weekend))
+        val both = """{"code":0,"data":{"plans":[
+            {"plan_id":"zcode-v3-start-plan-0817"},
+            {"plan_id":"zcode-v3-start-plan-1107-wk"}
+        ]}}"""
+        assertTrue(ZCodeActivation.classifyMissingCategories(both).isEmpty())
+    }
+
+    // ── Balance detail (#25) ───────────────────────────────────────────
+
+    @Test
+    fun `balance detail parses plans and buckets with full fields`() {
+        val body = """{"code":0,"data":{
+            "plans":[{"plan_id":"p1","show_name":"Start Plan","period":"daily","expires_at":"2026-11-08","capabilities":["model:GLM-5.3-Flash"]}],
+            "balances":[
+                {"show_name":"GLM-5.3-Flash","total_units":8000000,"used_units":100,"remaining_units":7999900,"period":"daily","expires_at":"2026-11-08","capabilities":["model:GLM-5.3-Flash"]},
+                {"show_name":"GLM-5.3","total_units":3000000,"used_units":0,"remaining_units":3000000,"period":"daily","expires_at":"2026-11-08"}
+            ]
+        }}"""
+        val detail = ZCodeActivation.parseBalanceDetail(body)
+        assertEquals(1, detail.plans.size)
+        assertEquals("Start Plan", detail.plans[0].name)
+        assertEquals(listOf("model:GLM-5.3-Flash"), detail.plans[0].capabilities)
+        assertEquals(2, detail.buckets.size)
+        assertEquals(7999900L, detail.buckets[0].remaining)
+        assertEquals("每日重置", detail.buckets[0].periodLabel)
+        assertEquals(listOf("model:GLM-5.3-Flash"), detail.buckets[0].capabilities)
+        assertEquals("2026-11-08", detail.buckets[1].expiresAt)
+        assertTrue(ZCodeActivation.parseBalanceDetail("garbage").buckets.isEmpty())
+    }
+
+    // ── Model id normalization + wire form (#22, #23) ─────────────────
+
+    @Test
+    fun `model ids normalize case-insensitively and strip context suffixes`() {
+        assertEquals("GLM-5.3-Flash", ZCodeConstants.normalizeModelId("glm-5.3-flash"))
+        assertEquals("GLM-5.3", ZCodeConstants.normalizeModelId("GLM-5.3[1m]"))
+        assertEquals("GLM-5-Turbo", ZCodeConstants.normalizeModelId("glm-5-turbo[200k]"))
+        assertEquals(null, ZCodeConstants.normalizeModelId("FOO"))
+        assertEquals(null, ZCodeConstants.normalizeModelId(""))
+    }
+
+    @Test
+    fun `wire model ids are lowercase`() {
+        assertEquals("glm-5.3-flash", ZCodeConstants.wireModelId("GLM-5.3-Flash"))
+        assertEquals("glm-5.3", ZCodeConstants.wireModelId("GLM-5.3"))
+        assertEquals("glm-5.2", ZCodeConstants.wireModelId("glm-5.2"))
+    }
+
+    @Test
+    fun `models for balance ids map to canonical entries, unknown dropped`() {
+        val models = ZCodeConstants.modelsForIds(
+            listOf("GLM-5.3-Flash", "glm-5.2", "NOPE"),
+        )
+        assertEquals(listOf("GLM-5.3-Flash", "GLM-5.2"), models.map { it.id })
+        assertTrue(ZCodeConstants.modelsForIds(emptyList()).isEmpty())
+    }
+
+    @Test
+    fun `only flash has vision`() {
+        assertTrue(ZCodeConstants.supportsVision("GLM-5.3-Flash"))
+        assertTrue(ZCodeConstants.supportsVision("glm-5.3-flash"))
+        assertFalse(ZCodeConstants.supportsVision("GLM-5.3"))
+        assertFalse(ZCodeConstants.supportsVision("GLM-5.2"))
+        assertFalse(ZCodeConstants.supportsVision("GLM-5-Turbo"))
+    }
+
+    // ── Captcha config parsing (#16) ───────────────────────────────────
+
+    @Test
+    fun `captcha config parses skip flag and live values`() {
+        val body = """{"code":0,"data":{"configs":{"captcha":{
+            "enabled":true,"prefix":"no8xfe","region":"sgp",
+            "sceneId":"11xygtvd","skip_model_request":true
+        }}}}"""
+        val config = ZCodeOAuthManager.parseCaptchaConfig(body)
+        assertEquals("11xygtvd", config!!.sceneId)
+        assertEquals("sgp", config.region)
+        assertEquals("no8xfe", config.prefix)
+        assertTrue(config.skipModelRequest)
+        assertTrue(config.enabled)
+        assertEquals(null, ZCodeOAuthManager.parseCaptchaConfig("""{"code":0,"data":{}}"""))
+        assertEquals(
+            null,
+            ZCodeOAuthManager.parseCaptchaConfig(
+                """{"code":0,"data":{"configs":{"captcha":{"region":"cn"}}}}""",
+            ),
+        )
+    }
+
+    // ── Version manifest (#19) ─────────────────────────────────────────
+
+    @Test
+    fun `manifest version parses from yaml text`() {
+        val manifest = "version: 3.17.2\nfiles:\n    - url: https://example.invalid/x.exe\n"
+        assertEquals("3.17.2", ZCodeConstants.parseManifestVersion(manifest))
+        assertEquals(null, ZCodeConstants.parseManifestVersion("no version here"))
+    }
+
+    @Test
+    fun `only newer versions are adopted`() {
+        assertTrue(ZCodeConstants.isNewerVersion("3.17.2", "3.17.1"))
+        assertFalse(ZCodeConstants.isNewerVersion("3.17.1", "3.17.2"))
+        assertFalse(ZCodeConstants.isNewerVersion("3.17.1", "3.17.1"))
+        assertTrue(ZCodeConstants.isNewerVersion("3.17.10", "3.17.2"))
+        assertFalse(ZCodeConstants.isNewerVersion("garbage", "3.17.1"))
+        assertFalse(ZCodeConstants.isNewerVersion("3.17.2", "garbage"))
+    }
+
+    // ── Retry table + param freshness (#12, #15) ───────────────────────
+
+    @Test
+    fun `retry 429 delays are one and three seconds, then stop`() {
+        assertEquals(1_000L, ZCodeOAuthManager.retry429DelayMs(0))
+        assertEquals(3_000L, ZCodeOAuthManager.retry429DelayMs(1))
+        assertEquals(null, ZCodeOAuthManager.retry429DelayMs(2))
+    }
+
+    @Test
+    fun `429 is not a captcha challenge`() {
+        assertFalse(
+            ZCodeCaptchaGate.isCaptchaChallenge(
+                429, """{"code":429,"msg":"too many requests"}""",
+            ),
+        )
+    }
+
+    @Test
+    fun `verify params expire after forty seconds`() {
+        val now = 1_700_000_000_000L
+        assertTrue(ZCodeCaptchaGate.isParamFresh(now, now))
+        assertTrue(ZCodeCaptchaGate.isParamFresh(now - 39_000, now))
+        assertFalse(ZCodeCaptchaGate.isParamFresh(now - 41_000, now))
+        assertFalse(ZCodeCaptchaGate.isParamFresh(0, now))
     }
 }
