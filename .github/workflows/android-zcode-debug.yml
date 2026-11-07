@@ -89,6 +89,18 @@ jobs:
           mkdir -p src/android/app/libs
           cp deps/build/rclone/rclone.aar src/android/app/libs/
 
+      - name: Raise Gradle heap (Kotlin backend OOM on huge offload methods)
+        # Run 42329583083 failed with OutOfMemoryError (GC overhead limit
+        # exceeded) in the Kotlin backend analyzer while transforming
+        # OpenOffloadHandler.maybeFallback — a pre-existing upstream method,
+        # untouched by the ZCode change. The repo pins the daemon heap to
+        # 2GB in gradle.properties; the ubuntu-latest runner has 16GB, so
+        # bump the checked-out copy to 4GB for this build only.
+        working-directory: src/android
+        run: |
+          sed -i 's/org.gradle.jvmargs=-Xmx2048m.*/org.gradle.jvmargs=-Xmx4096m -Dfile.encoding=UTF-8/' gradle.properties
+          grep org.gradle.jvmargs gradle.properties
+
       - name: Run ZCode unit tests
         working-directory: src/android
         run: ./gradlew :app:testGithubDebugUnitTest --tests "com.openminis.app.auth.ZCodeProviderTest" --no-daemon --console=plain
