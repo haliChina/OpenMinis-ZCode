@@ -3777,6 +3777,22 @@ class ProviderRepository(private val context: Context) {
             }
             oauthManagerFor(instance)?.importStoredTokensJson(tokenJson)
         }
+        // [T-zcode-import-device-mid] Keep the account's own device identity:
+        // zcode-accounts-bundle v2 exports the per-account virtualDeviceMid,
+        // and the account's billing/chat calls are keyed to it. Without this
+        // the import drops it and the app mints a fresh device id, which the
+        // upstream sees as a new device. Plain-text field; absent means do
+        // nothing — never generate or overwrite.
+        if (instance.providerType == ProviderType.zcode) {
+            dict.optString("zcodeDeviceMid", "").trim()
+                .takeIf { it.isNotEmpty() }
+                ?.let { mid ->
+                    oauthManagerFor(instance)?.importOAuthString(
+                        com.openminis.app.auth.ZCodeOAuthManager.KEY_DEVICE_MID,
+                        mid,
+                    )
+                }
+        }
         // Gemini account email + GCP project (base64-encoded OAuth strings).
         if (instance.providerType == ProviderType.gemini) {
             val mgr = oauthManagerFor(instance)

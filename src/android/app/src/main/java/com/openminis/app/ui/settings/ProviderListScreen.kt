@@ -200,22 +200,38 @@ fun ProviderListScreen(
                         key(instance.id) {
                             val modelCount = providerRepository.visibleEntries(instance.id).size
                             val apiKey = providerRepository.loadApiKey(instance.id)
+                            // [T-zcode-list-mask] One OAuthManager per row, reused
+                            // for both the configured dot and the masked key below:
+                            // OAuth credentials (e.g. ZCode's JWT) live in the
+                            // OAuth blob, not the api-key slot, so the row would
+                            // otherwise show "No API key" for a signed-in provider.
+                            val isOAuth = instance.credentialType ==
+                                com.openminis.app.data.model.ProviderCredential.oauth
+                            val oauthMgr = if (isOAuth) {
+                                com.openminis.app.auth.OAuthManager.forInstance(context, instance)
+                            } else {
+                                null
+                            }
                             // Mirrors iOS `isConfigured` on ProviderInstancesView:
                             // for OAuth providers, having a manual bearer token OR
                             // a stored OAuth credential counts as "configured" — not
                             // just the presence of an API key. Without this, OAuth
                             // instances always show the gray dot even after a
                             // successful sign-in or manual token paste.
-                            val isConfigured = if (instance.credentialType ==
-                                com.openminis.app.data.model.ProviderCredential.oauth) {
-                                val mgr = com.openminis.app.auth.OAuthManager.forInstance(context, instance)
-                                mgr?.isAuthenticated() == true
+                            val isConfigured = if (isOAuth) {
+                                oauthMgr?.isAuthenticated() == true
                             } else {
                                 // [T-empty-key-compat-endpoints] A keyless
                                 // third-party compatible endpoint is
                                 // configured-by-definition (mirrors iOS).
                                 !apiKey.isNullOrBlank() || instance.allowsEmptyAPIKey
                             }
+                            // Display key for the masked subtitle: the api-key slot
+                            // first (generic OAuth logins persist their token there),
+                            // then the OAuth blob's access token (ZCode's JWT never
+                            // lands in the api-key slot).
+                            val displayKey = apiKey?.takeIf { it.isNotBlank() }
+                                ?: oauthMgr?.storedAccessToken()
                             // [T-oauth-keep-credentials] Refresh rejected: the
                             // credential is kept but the row renders red.
                             val needsReauth = instance.credentialType ==
@@ -283,7 +299,11 @@ fun ProviderListScreen(
                                         ProviderInstanceRow(
                                             instance = instance,
                                             modelCount = modelCount,
-                                            apiKey = apiKey,
+                                            // [T-zcode-list-mask] The row masks whatever
+                                            // is passed here; displayKey falls back to
+                                            // the OAuth blob's access token so ZCode
+                                            // rows show a masked JWT, not "No API key".
+                                            apiKey = displayKey,
                                             isConfigured = isConfigured,
                                             needsReauth = needsReauth,
                                             onClick = { onProviderClick(instance.id) },

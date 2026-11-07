@@ -477,6 +477,18 @@ abstract class OAuthManager(
 
     fun loadManualBearerToken(): String? = loadOAuthString(KEY_MANUAL_BEARER)
 
+    /**
+     * Synchronous read of the credential the provider list row displays
+     * (masked), or null when this instance has no stored credential. Manual
+     * bearer token first, then the OAuth blob's access_token — the same
+     * precedence [validAccessToken] uses, but without refresh or network:
+     * pure prefs reads, safe to call during composition.
+     */
+    fun storedAccessToken(): String? {
+        loadManualBearerToken()?.takeIf { it.isNotEmpty() }?.let { return it }
+        return loadStoredTokens()?.optString("access_token", "")?.takeIf { it.isNotEmpty() }
+    }
+
     fun deleteManualBearerToken() {
         getEncryptedPrefs().edit()
             .remove("oauth_${KEY_MANUAL_BEARER}_$instanceId")
