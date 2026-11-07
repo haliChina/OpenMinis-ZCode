@@ -292,6 +292,7 @@ object ProviderFactory {
                     model = model,
                     instanceId = instance.id,
                     captchaConfigProvider = { oauthManager.fetchCaptchaConfig() },
+                    deviceMidProvider = { oauthManager.deviceMid() },
                 )
             }
             // [T-android-provider-type-parity] Types this build can decode and

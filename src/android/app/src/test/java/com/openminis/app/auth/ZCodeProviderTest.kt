@@ -1,5 +1,6 @@
 package com.openminis.app.auth
 
+import com.openminis.app.provider.zcode.ZCodeChatWire
 import com.openminis.app.provider.zcode.ZCodeSystemPrompt
 import org.json.JSONArray
 import org.json.JSONObject
@@ -133,7 +134,13 @@ class ZCodeProviderTest {
         assertEquals(3, system.length())
         val block1 = system.getJSONObject(0)
         assertEquals("You are ZCode, an interactive coding agent", block1.getString("text"))
-        assertFalse(block1.has("cache_control"))
+        // Block 1 carries cache_control: ephemeral like the official
+        // bundle (all three blocks); the v1 omission triggered 405/3012.
+        assertTrue(block1.has("cache_control"))
+        assertEquals(
+            "ephemeral",
+            block1.getJSONObject("cache_control").getString("type"),
+        )
         val block2 = system.getJSONObject(1)
         assertTrue(block2.has("cache_control"))
         assertTrue(block2.getString("text").contains("Be terse."))
@@ -272,6 +279,103 @@ class ZCodeProviderTest {
         assertEquals(
             null,
             ZCodeOAuthManager.parseReady(pending, ZCodeOAuthManager.LoginProvider.ZAI),
+        )
+    }
+
+    // ── Identity headers (3001/3012) ──────────────────────────────────
+
+    @Test
+    fun `header values must be visible ascii only`() {
+        assertEquals("abc-123", ZCodeOAuthManager.cleanHeaderValue("abc-123"))
+        assertEquals("abc", ZCodeOAuthManager.cleanHeaderValue("  abc  "))
+        assertEquals(null, ZCodeOAuthManager.cleanHeaderValue(""))
+        assertEquals(null, ZCodeOAuthManager.cleanHeaderValue("   "))
+        assertEquals(null, ZCodeOAuthManager.cleanHeaderValue(null))
+        // Non-ASCII and control characters drop the whole header.
+        assertEquals(null, ZCodeOAuthManager.cleanHeaderValue("中文"))
+        assertEquals(null, ZCodeOAuthManager.cleanHeaderValue("a\nb"))
+        assertEquals(null, ZCodeOAuthManager.cleanHeaderValue("a\tb"))
+    }
+
+    @Test
+    fun `abi maps to the short arch label`() {
+        assertEquals("arm64", ZCodeOAuthManager.archLabel("arm64-v8a"))
+        assertEquals("x64", ZCodeOAuthManager.archLabel("x86_64"))
+        assertEquals("arm", ZCodeOAuthManager.archLabel("armeabi-v7a"))
+        assertEquals("arm", ZCodeOAuthManager.archLabel("armeabi"))
+        assertEquals("x86", ZCodeOAuthManager.archLabel("x86"))
+    }
+
+    @Test
+    fun `identity headers carry all six fields with real values`() {
+        val headers = ZCodeOAuthManager.buildIdentityHeaders(
+            deviceMid = "11111111-2222-3333-4444-555555555555",
+            platform = "android-arm64",
+            osVersion = "14",
+            clientLanguage = "zh-CN",
+            clientTimezone = "Asia/Shanghai",
+        )
+        assertEquals("11111111-2222-3333-4444-555555555555", headers["X-Device-Mid"])
+        assertEquals("android-arm64", headers["X-Platform"])
+        assertEquals("android", headers["X-Os-Category"])
+        assertEquals("14", headers["X-Os-Version"])
+        assertEquals("zh-CN", headers["X-Client-Language"])
+        assertEquals("Asia/Shanghai", headers["X-Client-Timezone"])
+        assertEquals(6, headers.size)
+    }
+
+    @Test
+    fun `identity headers drop empty or non-ascii fields, never send them blank`() {
+        val headers = ZCodeOAuthManager.buildIdentityHeaders(
+            deviceMid = "11111111-2222-3333-4444-555555555555",
+            platform = "android-arm64",
+            osVersion = "",
+            clientLanguage = "中文",
+            clientTimezone = "Asia/Shanghai",
+        )
+        assertFalse(headers.containsKey("X-Os-Version"))
+        assertFalse(headers.containsKey("X-Client-Language"))
+        assertEquals("11111111-2222-3333-4444-555555555555", headers["X-Device-Mid"])
+        assertEquals("android", headers["X-Os-Category"])
+    }
+
+    @Test
+    fun `trace headers are six fresh uuids per call`() {
+        val first = ZCodeChatWire.buildTraceHeaders()
+        val second = ZCodeChatWire.buildTraceHeaders()
+        assertEquals(
+            setOf(
+                "x-request-id", "x-zcode-session-type", "x-zcode-trace-id",
+                "x-query-id", "x-zcode-query-source", "x-session-id",
+            ),
+            first.keys,
+        )
+        assertEquals("main", first["x-zcode-session-type"])
+        assertEquals("main_turn", first["x-zcode-query-source"])
+        val uuid = Regex(
+            "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        )
+        for (key in listOf("x-request-id", "x-zcode-trace-id", "x-query-id", "x-session-id")) {
+            assertTrue("$key is a uuid", uuid.matches(first[key].orEmpty()))
+            assertFalse("$key is fresh per request", first[key] == second[key])
+        }
+    }
+
+    @Test
+    fun `metadata object carries the jwt user id, absent when unknown`() {
+        assertEquals(
+            "user-123",
+            ZCodeChatWire.buildMetadataObject("user-123")?.getString("user_id"),
+        )
+        assertEquals(null, ZCodeChatWire.buildMetadataObject(null))
+        assertEquals(null, ZCodeChatWire.buildMetadataObject(""))
+        assertEquals(null, ZCodeChatWire.buildMetadataObject("   "))
+        // The JWT sub fallback feeds the same helper.
+        val jwt = makeJwt("sub-user", 2_000_000_000L)
+        assertEquals(
+            "sub-user",
+            ZCodeChatWire.buildMetadataObject(ZCodeOAuthManager.jwtUserId(jwt))
+                ?.getString("user_id"),
         )
     }
 }

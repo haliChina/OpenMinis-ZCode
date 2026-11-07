@@ -46,6 +46,15 @@ import java.security.SecureRandom
  * Billing calls (balance / current / preview / claim) are manual, one shot
  * each, and share the captcha retry in [billingCall]: on a 3007 challenge
  * the user is asked once through [ZCodeCaptchaGate]; cancel aborts.
+ *
+ * Identity headers (added after live 3001/3012 failures — the v1
+ * "no device fingerprint" stance was wrong): every billing and chat
+ * request carries the full client identity — a stable per-device id
+ * ([deviceMid]), this phone's real platform/OS/language/timezone (see
+ * [buildIdentityHeaders]) and the ZCode client version. Billing 400s
+ * with 3001 parameter error when X-Device-Mid is missing; chat 405s
+ * with 3012 when the identity set is incomplete. Values are the
+ * phone's own, never a desktop spoof.
  */
 class ZCodeOAuthManager(
     context: Context,
@@ -104,6 +113,9 @@ class ZCodeOAuthManager(
         private const val TAG = "ZCodeOAuth"
 
         private const val KEY_PLAN_MODE = "zcode_plan_mode"
+
+        /** EncryptedPrefs key for the stable device id (see [deviceMid]). */
+        const val KEY_DEVICE_MID = "zcode_device_mid"
 
         private val JSON_MEDIA = "application/json".toMediaType()
 
@@ -201,6 +213,77 @@ class ZCodeOAuthManager(
                 ?: jwtUserId(token)
             val expiresAt = jwtExpiryMs(token) ?: (System.currentTimeMillis() + 3600_000)
             return JwtResult(token, providerAccess, userId, expiresAt, providerRefresh)
+        }
+
+        /**
+         * Visible-ASCII gate, mirroring the gateway `_clean`: a header
+         * value is sent only when it is non-empty after trimming and
+         * consists entirely of printable ASCII (0x20–0x7E). Anything
+         * else returns null and the caller drops that header instead of
+         * sending a blank or malformed value.
+         */
+        fun cleanHeaderValue(value: String?): String? {
+            val v = value?.trim().orEmpty()
+            if (v.isEmpty()) return null
+            if (v.any { it.code !in 0x20..0x7E }) return null
+            return v
+        }
+
+        /** Short arch label for X-Platform, from an Android ABI string. */
+        fun archLabel(abi: String): String = when (abi) {
+            "arm64-v8a" -> "arm64"
+            "x86_64" -> "x64"
+            "armeabi-v7a", "armeabi" -> "arm"
+            "x86" -> "x86"
+            else -> cleanHeaderValue(abi) ?: "unknown"
+        }
+
+        /**
+         * Pure identity-header builder: the device-derived fields both
+         * the billing set and the chat set need. [platform] is the full
+         * value, e.g. "android-arm64" — see [currentIdentityHeaders] for
+         * the Android-derived call. Every value passes through
+         * [cleanHeaderValue]; a field that ends up empty is omitted,
+         * never sent blank. X-Os-Category is always "android" here —
+         * this client runs on a phone, and nothing is spoofed as a
+         * desktop client.
+         */
+        fun buildIdentityHeaders(
+            deviceMid: String,
+            platform: String,
+            osVersion: String,
+            clientLanguage: String,
+            clientTimezone: String,
+        ): Map<String, String> {
+            val out = linkedMapOf<String, String>()
+            fun put(name: String, value: String?) {
+                cleanHeaderValue(value)?.let { out[name] = it }
+            }
+            put("X-Device-Mid", deviceMid)
+            put("X-Platform", platform)
+            put("X-Os-Category", "android")
+            put("X-Os-Version", osVersion)
+            put("X-Client-Language", clientLanguage)
+            put("X-Client-Timezone", clientTimezone)
+            return out
+        }
+
+        /**
+         * Identity headers from this phone's real values: first ABI in
+         * [android.os.Build.SUPPORTED_ABIS], [android.os.Build.VERSION.RELEASE],
+         * the default locale's language tag and the default timezone id.
+         * Delegates to [buildIdentityHeaders], so the sanitizing rules
+         * are shared and unit-tested.
+         */
+        fun currentIdentityHeaders(deviceMid: String): Map<String, String> {
+            val abi = android.os.Build.SUPPORTED_ABIS.firstOrNull().orEmpty()
+            return buildIdentityHeaders(
+                deviceMid = deviceMid,
+                platform = "android-${archLabel(abi)}",
+                osVersion = android.os.Build.VERSION.RELEASE ?: "",
+                clientLanguage = java.util.Locale.getDefault().toLanguageTag(),
+                clientTimezone = java.util.TimeZone.getDefault().id,
+            )
         }
 
         /** Decode a JWT payload without verifying the signature — the
@@ -417,6 +500,26 @@ class ZCodeOAuthManager(
         saveOAuthString("tokens", blob.toString())
     }
 
+    /**
+     * Stable device id for this provider instance. Generated once
+     * (random UUID) and persisted with [saveOAuthString] under
+     * [KEY_DEVICE_MID], so it survives restarts and is the SAME value
+     * for billing and chat. Required: billing returns 3001 parameter
+     * error without X-Device-Mid, and chat risk-control (3012) wants
+     * the full identity set.
+     *
+     * Note: this key is NOT part of the exported `oauth_tokens` blob,
+     * so a backup restore generates a fresh id — upstream accepts that
+     * as a new device. It is stable for the life of the install, which
+     * is what the 3001/3012 checks need.
+     */
+    fun deviceMid(): String {
+        loadOAuthString(KEY_DEVICE_MID)?.takeIf { it.isNotBlank() }?.let { return it }
+        val fresh = java.util.UUID.randomUUID().toString()
+        saveOAuthString(KEY_DEVICE_MID, fresh)
+        return fresh
+    }
+
     private fun sanitizedError(body: String): String =
         OAuthManager.sanitizeBody(body, 200)
 
@@ -495,6 +598,18 @@ class ZCodeOAuthManager(
             .copy(retriedWithCaptcha = true)
     }
 
+    /**
+     * One billing request with the full gateway `_auth_headers` set
+     * (verified in dengyie `quota.py`): the billing family 400s with
+     * 3001 parameter error when X-Device-Mid is missing, so the whole
+     * identity set is sent — Content-Type, User-Agent, HTTP-Referer,
+     * X-Title, X-ZCode-App-Version, X-Platform, X-Release-Channel,
+     * X-Client-Language, X-Client-Timezone, X-Os-Category, X-Os-Version,
+     * X-Device-Mid, a fresh x-request-id per request, and Authorization.
+     * There is NO anthropic-version on this path (the gateway's billing
+     * headers do not have one). Captcha verify headers are added on the
+     * retry only, as before.
+     */
     private fun executeBilling(
         method: String,
         path: String,
@@ -506,7 +621,16 @@ class ZCodeOAuthManager(
         val builder = Request.Builder()
             .url("${ZCodeConstants.PLAN_BASE}/$path")
             .header("Authorization", "Bearer $jwt")
-            .header("anthropic-version", "2023-06-01")
+            .header("Content-Type", "application/json")
+            .header("User-Agent", "ZCode/${ZCodeConstants.CLIENT_APP_VERSION}")
+            .header("HTTP-Referer", "https://zcode.z.ai")
+            .header("X-Title", "Z Code@electron")
+            .header("X-ZCode-App-Version", ZCodeConstants.CLIENT_APP_VERSION)
+            .header("X-Release-Channel", "production")
+            .header("x-request-id", java.util.UUID.randomUUID().toString())
+        for ((name, value) in currentIdentityHeaders(deviceMid())) {
+            builder.header(name, value)
+        }
         if (verifyParam != null) {
             builder.header("X-Aliyun-Captcha-Verify-Param", verifyParam)
             if (!region.isNullOrBlank()) builder.header("X-Aliyun-Captcha-Verify-Region", region)

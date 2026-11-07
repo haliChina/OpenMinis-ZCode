@@ -10,9 +10,12 @@ import java.time.format.DateTimeFormatter
  * enforces (verified in dengyie `body_transform.py` and kilim
  * `system-prompt.ts` / `body-transformer.ts`):
  *
- *   Block 1 — cliPrefix, alone, NO cache_control. The gateway checks the
- *   first block's identity; appending a 4th block or folding the prefix
- *   into another block has been observed to trigger 405 / 3012.
+ *   Block 1 — cliPrefix, alone, WITH `cache_control: ephemeral` (the
+ *   official bundle carries ephemeral on all three blocks; the v1
+ *   omission was observed to trigger 405 / 3012 — the gateway checks
+ *   the first block's identity, and a missing cache_control breaks
+ *   the shape). Appending a 4th block or folding the prefix into
+ *   another block has been observed to trigger 405 / 3012.
  *   Block 2 — stable behaviour, `cache_control: ephemeral`; the caller's
  *   system prompt is appended to the END of this block (never as its own
  *   block).
@@ -39,10 +42,12 @@ Keep answers concise; use code blocks for code and plain language for explanatio
 
     fun build(clientSystem: String?, modelId: String, workingDirectory: String?): JSONArray {
         val arr = JSONArray()
-        // Block 1: cliPrefix alone, no cache_control.
+        // Block 1: cliPrefix alone, WITH cache_control: ephemeral —
+        // the official bundle carries ephemeral on all three blocks.
         arr.put(JSONObject().apply {
             put("type", "text")
             put("text", CLI_PREFIX)
+            put("cache_control", JSONObject().put("type", "ephemeral"))
         })
         // Block 2: stable + client system appended at the end.
         val block2 = buildString {

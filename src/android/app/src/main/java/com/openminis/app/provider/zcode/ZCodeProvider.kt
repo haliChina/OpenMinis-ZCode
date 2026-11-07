@@ -2,6 +2,7 @@ package com.openminis.app.provider.zcode
 
 import com.openminis.app.auth.ZCodeCaptchaGate
 import com.openminis.app.auth.ZCodeConstants
+import com.openminis.app.auth.ZCodeOAuthManager
 import com.openminis.app.data.model.AgentContentPart
 import com.openminis.app.data.model.AgentToolDefinition
 import com.openminis.app.data.model.LLMError
@@ -51,8 +52,19 @@ import java.util.concurrent.TimeUnit
  * - Concurrency is capped at 2 per instance (upstream's observed per-
  *   account limit), via a static [Semaphore] keyed by instance id — the
  *   cap survives provider rebuilds, which a per-object semaphore would not.
- * - No fingerprint simulation: no device_mid / install_id / platform SKU
- *   headers are sent. Only the client identity (ZCode/3.17.1) is claimed.
+ * - Identity headers: every request carries the full client identity
+ *   (X-Device-Mid, X-Platform, X-Os-Category, X-Os-Version,
+ *   X-Client-Language, X-Client-Timezone, HTTP-Referer, X-Title,
+ *   X-ZCode-App-Version, X-Release-Channel, plus per-request trace
+ *   headers) — live 3001/3012 failures proved the v1 "no device
+ *   fingerprint" stance wrong: billing 400s with 3001 when
+ *   X-Device-Mid is missing, and chat 405s with 3012 when the identity
+ *   set is incomplete. The values are this phone's real ones (see
+ *   [ZCodeOAuthManager.buildIdentityHeaders]); nothing is spoofed as a
+ *   desktop client. The device id is stable per provider instance and
+ *   is the SAME value billing sends.
+ * - The request body carries metadata.user_id from the JWT payload
+ *   (user_id/sub); when the JWT has none, no metadata is sent.
  * - No thinking fields are sent: the GLM thinking contract on this
  *   channel is unverified, and guessing `thinking`/`output_config` shapes
  *   is how working requests start 400ing. [thinkingLevel] is accepted and
@@ -74,6 +86,10 @@ class ZCodeProvider(
     /** Supplies the captcha config for a manual retry; null when the
      *  caller cannot provide one (context-less construction). */
     private val captchaConfigProvider: (suspend () -> ZCodeCaptchaGate.Config)? = null,
+    /** Supplies the stable device id (same value billing sends); null
+     *  only for context-less construction, which falls back to a
+     *  per-instance id. */
+    private val deviceMidProvider: (() -> String)? = null,
     private val workingDirectory: String? = null,
 ) : LLMProvider, com.openminis.app.network.NetworkTagged {
 
@@ -101,6 +117,12 @@ class ZCodeProvider(
             concurrencyByInstance.getOrPut(instanceId) { Semaphore(2) }
     }
 
+    /** Fallback device id for context-less construction (no manager to
+     *  ask): stable for the life of this provider object, never
+     *  persisted. The factory always supplies [deviceMidProvider], so
+     *  this is only a safety net. */
+    private val fallbackDeviceMid = java.util.UUID.randomUUID().toString()
+
     // ── Non-streaming ──────────────────────────────────────────────────
 
     override suspend fun sendMessageClamped(
@@ -115,7 +137,7 @@ class ZCodeProvider(
         semaphoreFor(instanceId).withPermit {
             val jwt = jwtProvider()
                 ?: throw LLMError.InvalidApiKey("未登录 ZCode，登录已过期请重新登录。")
-            val body = buildRequestBody(messages, systemPrompt, maxTokens, stream = false, temperature, imageParts, tools)
+            val body = buildRequestBody(messages, systemPrompt, maxTokens, stream = false, temperature, imageParts, tools, ZCodeOAuthManager.jwtUserId(jwt))
             val response = executeWithCaptchaRetry(jwt, body.toString())
             val responseBody = response.body?.string().orEmpty()
             response.close()
@@ -151,7 +173,7 @@ class ZCodeProvider(
         try {
             val jwt = jwtProvider()
                 ?: throw LLMError.InvalidApiKey("未登录 ZCode，登录已过期请重新登录。")
-            val body = buildRequestBody(messages, systemPrompt, maxTokens, stream = true, temperature, imageParts, tools)
+            val body = buildRequestBody(messages, systemPrompt, maxTokens, stream = true, temperature, imageParts, tools, ZCodeOAuthManager.jwtUserId(jwt))
             val response = executeWithCaptchaRetry(jwt, body.toString())
             if (!response.isSuccessful) {
                 val errorBody = response.body?.string().orEmpty()
@@ -294,6 +316,21 @@ class ZCodeProvider(
             .header("User-Agent", "ZCode/${ZCodeConstants.CLIENT_APP_VERSION}")
             .header("X-ZCode-App-Version", ZCodeConstants.CLIENT_APP_VERSION)
             .header("X-ZCode-Agent", "glm")
+            .header("HTTP-Referer", "https://zcode.z.ai")
+            .header("X-Title", "Z Code@electron")
+            .header("X-Release-Channel", "production")
+        // Full client identity (3001/3012): the device id is the SAME
+        // value billing sends; the rest is this phone's real platform,
+        // OS, language and timezone.
+        val deviceMid = deviceMidProvider?.invoke() ?: fallbackDeviceMid
+        for ((name, value) in ZCodeOAuthManager.currentIdentityHeaders(deviceMid)) {
+            builder.header(name, value)
+        }
+        // Per-request trace headers: fresh UUIDs on every build,
+        // including the captcha retry (which is a new request).
+        for ((name, value) in ZCodeChatWire.buildTraceHeaders()) {
+            builder.header(name, value)
+        }
         if (verifyParam != null) {
             builder.header("X-Aliyun-Captcha-Verify-Param", verifyParam)
             if (!region.isNullOrBlank()) builder.header("X-Aliyun-Captcha-Verify-Region", region)
@@ -311,6 +348,7 @@ class ZCodeProvider(
         temperature: Double?,
         imageParts: List<LLMMessage.ImagePart>,
         tools: List<AgentToolDefinition>,
+        userId: String? = null,
     ): JSONObject {
         val body = JSONObject()
         body.put("model", model.id)
@@ -318,6 +356,7 @@ class ZCodeProvider(
         body.put("max_tokens", maxTokens.coerceIn(1, ceiling))
         body.put("stream", stream)
         if (temperature != null) body.put("temperature", temperature)
+        ZCodeChatWire.buildMetadataObject(userId)?.let { body.put("metadata", it) }
         body.put("system", ZCodeSystemPrompt.build(systemPrompt, model.id, workingDirectory))
         if (tools.isNotEmpty()) {
             val toolsArray = JSONArray()
