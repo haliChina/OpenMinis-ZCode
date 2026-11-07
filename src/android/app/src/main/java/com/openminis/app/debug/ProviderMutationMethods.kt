@@ -213,6 +213,9 @@ internal object ProviderMutationMethods {
             ProviderType.xAI -> "https://api.x.ai/v1"
             ProviderType.kimiCode -> "https://api.kimi.com/coding/v1"
             ProviderType.githubCopilot -> com.openminis.app.auth.CopilotDeviceFlow.API_BASE
+            // [T-zcode-provider] Plan channel base (chat path is
+            // /anthropic/v1/messages under this base).
+            ProviderType.zcode -> "https://zcode.z.ai/api/v1/zcode-plan"
             ProviderType.antigravity, ProviderType.unsupported -> ""
         }
         val probeURL = when (instance.providerType) {
@@ -227,6 +230,10 @@ internal object ProviderMutationMethods {
             ProviderType.kimiCode -> if (baseURL.endsWith("/v1")) "$baseURL/models" else "$baseURL/v1/models"
             // [T-copilot-provider] /models sits at the API root, no /v1.
             ProviderType.githubCopilot -> "$baseURL/models"
+            // [T-zcode-provider] The plan channel has no /models probe
+            // endpoint; probe the base and let it fail like the undrivable
+            // types below.
+            ProviderType.zcode -> baseURL
             // No probe endpoint for a type this build cannot drive.
             ProviderType.antigravity, ProviderType.unsupported -> baseURL
         }
@@ -254,6 +261,10 @@ internal object ProviderMutationMethods {
             // run the exchange, so this one is left unauthenticated and is
             // expected to 401; Quick Test is the real check.
             ProviderType.githubCopilot -> { /* session token not available here */ }
+            // [T-zcode-provider] The JWT lives in the OAuth store, not the
+            // apiKey slot, so this probe runs unauthenticated like Copilot's;
+            // Quick Test is the real check.
+            ProviderType.zcode -> { /* JWT not available here */ }
             // [T-android-provider-type-parity] No auth scheme known for a type
             // this build cannot drive; the probe will simply fail.
             ProviderType.antigravity, ProviderType.unsupported -> { /* no auth */ }

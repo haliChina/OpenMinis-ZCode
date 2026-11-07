@@ -114,6 +114,8 @@ object VoiceProviderFactory {
             ProviderType.kimiCode -> null
             // [T-copilot-provider] Copilot is chat-only — no TTS/STT endpoints.
             ProviderType.githubCopilot -> null
+            // [T-zcode-provider] ZCode is chat-only — no TTS/STT endpoints.
+            ProviderType.zcode -> null
             // [T-android-provider-type-parity] No voice support for types this
             // build cannot drive.
             ProviderType.antigravity, ProviderType.unsupported -> null

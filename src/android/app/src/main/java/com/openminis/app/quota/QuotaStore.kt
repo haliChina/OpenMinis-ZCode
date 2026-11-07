@@ -889,6 +889,10 @@ object QuotaStore {
             ProviderType.xAI -> QuotaInstanceDescriptor.ProviderKind.xAI
             ProviderType.kimiCode -> QuotaInstanceDescriptor.ProviderKind.kimiCode
             ProviderType.githubCopilot -> QuotaInstanceDescriptor.ProviderKind.githubCopilot
+            // [T-zcode-provider] ProviderKind has no zcode entry; ZCode
+            // balance is shown by the manual console, not QuotaStore, so
+            // it falls back to unsupported (no vendor-specific refresh).
+            ProviderType.zcode -> QuotaInstanceDescriptor.ProviderKind.unsupported
             ProviderType.unsupported -> QuotaInstanceDescriptor.ProviderKind.unsupported
         },
         isOAuth = instance.credentialType == ProviderCredential.oauth,
@@ -908,7 +912,9 @@ object QuotaStore {
         ProviderType.openAI, ProviderType.openAIResponses, ProviderType.openRouter, ProviderType.xAI,
         ProviderType.kimiCode, ProviderType.githubCopilot ->
             com.openminis.app.provider.OpenCodeSessionHeader.matches(instance.customBaseURL)
-        ProviderType.anthropic, ProviderType.gemini, ProviderType.antigravity, ProviderType.unsupported -> false
+        ProviderType.anthropic, ProviderType.gemini, ProviderType.antigravity, ProviderType.unsupported,
+        // [T-zcode-provider] ZCode speaks Anthropic, not OpenCode protocol.
+        ProviderType.zcode -> false
     }
 
     /**

@@ -88,6 +88,9 @@ internal object ProviderDebugMethods {
         // [T-android-provider-type-parity] Responses API shares the OpenAI
         // host; undrivable types have no canonical base to report.
         ProviderType.openAIResponses -> "https://api.openai.com"
+        // [T-zcode-provider] Plan channel host; the chat path is
+        // /api/v1/zcode-plan/anthropic/v1/messages (see ZCodeConstants).
+        ProviderType.zcode -> "https://zcode.z.ai"
         ProviderType.antigravity, ProviderType.unsupported -> ""
     }
 

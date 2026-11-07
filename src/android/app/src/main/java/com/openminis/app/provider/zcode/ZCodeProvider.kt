@@ -12,6 +12,7 @@ import com.openminis.app.data.model.LLMStreamChunk
 import com.openminis.app.data.model.LLMUsage
 import com.openminis.app.data.model.ThinkingLevel
 import com.openminis.app.data.model.WireToolIdMap
+import com.openminis.app.provider.ImageBudget
 import com.openminis.app.provider.LLMProvider
 import com.openminis.app.provider.failOnSilentEmptyCompletion
 import com.openminis.app.provider.safeOptString
@@ -414,6 +415,10 @@ class ZCodeProvider(
                                 if (part.isError) put("is_error", true)
                             })
                         }
+                        // [T-zcode-provider] History image bytes (restored
+                        // sessions, retry-after-edit, agent-emitted
+                        // ImageData) — same image block as AnthropicProvider.
+                        is AgentContentPart.ImageData -> currentBlocks.add(imageBlock(part.data, part.mimeType))
                     }
                 }
             } else if (msg.content.isNotEmpty()) {
@@ -447,6 +452,29 @@ class ZCodeProvider(
         }
         flush()
         return out
+    }
+
+    /**
+     * [T-zcode-provider] One inline image as an Anthropic content block —
+     * mirrors AnthropicProvider.imageBlock: format, byte budget and
+     * `media_type` come from [ImageBudget.prepareForUpload], so an image
+     * that cannot be made sendable becomes a text block instead of a
+     * request the API rejects on every retry.
+     */
+    private fun imageBlock(data: ByteArray, declaredMime: String?): JSONObject {
+        val upload = ImageBudget.prepareForUpload(data, declaredMime)
+            ?: return JSONObject().apply {
+                put("type", "text")
+                put("text", ImageBudget.UNSENDABLE_IMAGE_PLACEHOLDER)
+            }
+        return JSONObject().apply {
+            put("type", "image")
+            put("source", JSONObject().apply {
+                put("type", "base64")
+                put("media_type", upload.mimeType)
+                put("data", upload.base64())
+            })
+        }
     }
 
     // ── Response parsing / errors ──────────────────────────────────────

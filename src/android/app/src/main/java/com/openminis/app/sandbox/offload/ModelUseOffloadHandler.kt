@@ -1405,7 +1405,8 @@ class ModelUseOffloadHandler(
             """.trimIndent()
             // xAI (Grok) / Kimi Coding have no image-output models in the
             // current catalog — fall through to empty hint like Anthropic.
-            ProviderType.anthropic, ProviderType.xAI, ProviderType.kimiCode,
+            // [T-zcode-provider] ZCode has no image-output models either.
+            ProviderType.anthropic, ProviderType.xAI, ProviderType.kimiCode, ProviderType.zcode,
             // [T-copilot-provider] Copilot exposes no image-output model.
             ProviderType.githubCopilot,
             // [T-android-provider-type-parity] No image-param hint for types
