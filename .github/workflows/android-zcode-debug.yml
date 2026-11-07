@@ -46,12 +46,25 @@ jobs:
         with:
           go-version: "1.25"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Set up Android SDK (preinstalled on runner)
+        # Do NOT use android-actions/setup-android@v3: on the 2026 runner it
+        # runs `sdkmanager tools`, a package name removed from cmdline-tools
+        # 16.0, and fails with exit code 1 before any of our steps run.
+        # The ubuntu-latest runner already ships an Android SDK, so just
+        # point at it, accept licenses, and install what we need below.
+        run: |
+          SDK=/usr/local/lib/android/sdk
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          ls "$SDK/cmdline-tools"
+          SDKMANAGER=$(ls -d "$SDK"/cmdline-tools/*/bin/sdkmanager | head -n 1)
+          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
+          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
+          yes | "$SDKMANAGER" --licenses || true
 
       - name: Install NDK r28, CMake 3.22.1, platforms, build-tools
         run: |
-          sdkmanager "ndk;${ANDROID_NDK_VERSION}" "cmake;3.22.1" \
+          "$SDKMANAGER" "ndk;${ANDROID_NDK_VERSION}" "cmake;3.22.1" \
             "platforms;android-36" "platforms;android-35" "build-tools;36.0.0"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
 
