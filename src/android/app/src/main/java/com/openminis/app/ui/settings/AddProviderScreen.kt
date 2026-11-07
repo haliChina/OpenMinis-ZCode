@@ -793,6 +793,10 @@ private fun ColumnScope.OAuthConfigSection(
     var zcodeAuth by remember {
         mutableStateOf<com.openminis.app.auth.ZCodeOAuthManager.InitResult?>(null)
     }
+    // [T-zcode-provider-bigmodel] Which account to sign in with. Set by
+    // the choice dialog; the sign-in button opens the dialog for ZCode
+    // instead of starting the flow directly.
+    var showZcodeLoginChoice by remember { mutableStateOf(false) }
     zcodeAuth?.let { init ->
         AlertDialog(
             onDismissRequest = {
@@ -802,7 +806,15 @@ private fun ColumnScope.OAuthConfigSection(
             title = { Text(stringResource(R.string.zcode_login_title)) },
             text = {
                 Column {
-                    Text(stringResource(R.string.zcode_login_instructions))
+                    Text(
+                        stringResource(
+                            if (init.provider == com.openminis.app.auth.ZCodeOAuthManager.LoginProvider.BIGMODEL) {
+                                R.string.zcode_login_instructions_bigmodel
+                            } else {
+                                R.string.zcode_login_instructions
+                            },
+                        ),
+                    )
                     Spacer(Modifier.height(8.dp))
                     Text(
                         stringResource(R.string.zcode_risk_notice),
@@ -921,7 +933,13 @@ private fun ColumnScope.OAuthConfigSection(
                 // as a named lambda so there is exactly one path that can
                 // begin Device Flow — an inline onClick would leave the
                 // ungated call site one edit away from coming back.
-                val beginSignIn: () -> Unit = {
+                // [T-zcode-provider-bigmodel] The provider argument only
+                // matters for ZCode; every other sign-in path ignores it,
+                // so it defaults to Z.ai and existing call sites stay as-is.
+                fun beginSignIn(
+                    loginProvider: com.openminis.app.auth.ZCodeOAuthManager.LoginProvider =
+                        com.openminis.app.auth.ZCodeOAuthManager.LoginProvider.ZAI,
+                ) {
                     isAuthenticating = true
                     errorMessage = null
                     kimiLoginJob = scope.launch {
@@ -958,11 +976,13 @@ private fun ColumnScope.OAuthConfigSection(
                                         // init, open the authorize URL in a
                                         // Custom Tab, poll until the user
                                         // authorizes (300s). No localhost
-                                        // callback server on this path.
+                                        // callback server on this path. The
+                                        // account (Z.ai / BigModel) comes
+                                        // from the choice dialog.
                                         val mgr = com.openminis.app.auth.ZCodeOAuthManager(
                                             context, pendingInstanceId,
                                         )
-                                        val init = mgr.beginLogin()
+                                        val init = mgr.beginLogin(loginProvider)
                                         zcodeAuth = init
                                         OAuthTabLauncher.launch(
                                             context, Uri.parse(init.authorizeUrl),
@@ -1056,6 +1076,43 @@ private fun ColumnScope.OAuthConfigSection(
                     )
                 }
 
+                // [T-zcode-provider-bigmodel] Mounted HERE, next to the
+                // Copilot gate, for the same reason: the choice is the only
+                // path into the ZCode flow, so it lives next to the lambda
+                // it calls instead of being hoisted through nullable state.
+                if (showZcodeLoginChoice) {
+                    AlertDialog(
+                        onDismissRequest = { showZcodeLoginChoice = false },
+                        title = { Text(stringResource(R.string.zcode_login_choose_title)) },
+                        text = {
+                            Column {
+                                Text(stringResource(R.string.zcode_login_choose_text))
+                                Spacer(Modifier.height(16.dp))
+                                TextButton(
+                                    onClick = {
+                                        showZcodeLoginChoice = false
+                                        beginSignIn(com.openminis.app.auth.ZCodeOAuthManager.LoginProvider.ZAI)
+                                    },
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) { Text(stringResource(R.string.zcode_login_choose_zai)) }
+                                TextButton(
+                                    onClick = {
+                                        showZcodeLoginChoice = false
+                                        beginSignIn(com.openminis.app.auth.ZCodeOAuthManager.LoginProvider.BIGMODEL)
+                                    },
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) { Text(stringResource(R.string.zcode_login_choose_bigmodel)) }
+                            }
+                        },
+                        confirmButton = {},
+                        dismissButton = {
+                            TextButton(onClick = { showZcodeLoginChoice = false }) {
+                                Text(stringResource(R.string.common_cancel))
+                            }
+                        },
+                    )
+                }
+
                 MinisButton(
                     onClick = {
                         // [T-copilot-disclaimer] Copilot: show the disclaimer
@@ -1065,6 +1122,11 @@ private fun ColumnScope.OAuthConfigSection(
                             !com.openminis.app.util.CopilotFeatureFlag.hasAcceptedConsent(context)
                         ) {
                             showCopilotDisclaimer = true
+                        } else if (providerType == ProviderType.zcode) {
+                            // [T-zcode-provider-bigmodel] ZCode: ask which
+                            // account first; the dialog calls beginSignIn
+                            // with the chosen provider.
+                            showZcodeLoginChoice = true
                         } else {
                             beginSignIn()
                         }

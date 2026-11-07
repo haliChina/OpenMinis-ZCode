@@ -2383,6 +2383,12 @@
     <string name="add_provider_subtitle_zcode">Sign in with ZCode — free Start Plan quota, direct in-app</string>
     <string name="zcode_login_title">Sign in with ZCode</string>
     <string name="zcode_login_instructions">A browser page has opened. Sign in with your z.ai account there and authorize Minis. This screen will continue automatically once you authorize (up to 5 minutes).</string>
+    <!-- [T-zcode-provider-bigmodel] BigModel sign-in choice + waiting text -->
+    <string name="zcode_login_choose_title">Choose how to sign in</string>
+    <string name="zcode_login_choose_text">ZCode supports two accounts. Sign in with the one that holds your plan — the free Start Plan quota lives on the Z.ai side.</string>
+    <string name="zcode_login_choose_zai">Sign in with Z.ai</string>
+    <string name="zcode_login_choose_bigmodel">Sign in with BigModel</string>
+    <string name="zcode_login_instructions_bigmodel">A browser page has opened. Sign in with your bigmodel.cn account there and authorize Minis. This screen will continue automatically once you authorize (up to 5 minutes).</string>
     <string name="zcode_login_open_browser">Open in browser</string>
     <string name="zcode_risk_notice">ZCode’s free quota is an official-client entitlement. Driving it from a third-party client may breach the provider’s terms and risk rate limiting or suspension of your account. Use only your own account.</string>
     <string name="copilot_disclaimer_title">Notice regarding unofficial access</string>

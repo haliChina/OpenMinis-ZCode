@@ -998,6 +998,9 @@ private fun OAuthCredentialBlock(
     var zcodeAuth by remember(instance.id) {
         mutableStateOf<com.openminis.app.auth.ZCodeOAuthManager.InitResult?>(null)
     }
+    // [T-zcode-provider-bigmodel] Which account to sign in with; the
+    // Sign In buttons open the choice dialog for ZCode.
+    var showZcodeLoginChoice by remember(instance.id) { mutableStateOf(false) }
     zcodeAuth?.let { init ->
         AlertDialog(
             onDismissRequest = {
@@ -1005,7 +1008,17 @@ private fun OAuthCredentialBlock(
                 zcodeAuth = null
             },
             title = { Text(stringResource(R.string.zcode_login_title)) },
-            text = { Text(stringResource(R.string.zcode_login_instructions)) },
+            text = {
+                Text(
+                    stringResource(
+                        if (init.provider == com.openminis.app.auth.ZCodeOAuthManager.LoginProvider.BIGMODEL) {
+                            R.string.zcode_login_instructions_bigmodel
+                        } else {
+                            R.string.zcode_login_instructions
+                        },
+                    ),
+                )
+            },
             confirmButton = {
                 TextButton(onClick = {
                     OAuthTabLauncher.launch(context, Uri.parse(init.authorizeUrl))
@@ -1027,7 +1040,12 @@ private fun OAuthCredentialBlock(
     }
 
     // Shared by the Sign In button and, for a rejected refresh, Sign In Again.
-    fun startSignIn() {
+    // [T-zcode-provider-bigmodel] The provider argument only matters for
+    // ZCode; every other sign-in path ignores it, so it defaults to Z.ai.
+    fun startSignIn(
+        loginProvider: com.openminis.app.auth.ZCodeOAuthManager.LoginProvider =
+            com.openminis.app.auth.ZCodeOAuthManager.LoginProvider.ZAI,
+    ) {
         if (isAuthenticating) return
         isAuthenticating = true
         authError = null
@@ -1059,11 +1077,12 @@ private fun OAuthCredentialBlock(
                     ProviderType.zcode -> {
                         // [T-zcode-provider] CLI init/poll re-login; the
                         // JWT is persisted by the manager, not mirrored
-                        // into the api-key store.
+                        // into the api-key store. The account (Z.ai /
+                        // BigModel) comes from the choice dialog.
                         val mgr = com.openminis.app.auth.ZCodeOAuthManager(
                             context, instance.id,
                         )
-                        val init = mgr.beginLogin()
+                        val init = mgr.beginLogin(loginProvider)
                         zcodeAuth = init
                         OAuthTabLauncher.launch(context, Uri.parse(init.authorizeUrl))
                         mgr.finishLogin(init).also { zcodeAuth = null }
@@ -1114,6 +1133,42 @@ private fun OAuthCredentialBlock(
                 com.openminis.app.auth.OAuthForegroundGate.end()
             }
         }
+    }
+
+    // [T-zcode-provider-bigmodel] Mounted HERE, right after the function
+    // it calls — a dialog mounted before startSignIn's declaration could
+    // not reference it. ZCode is the only provider that opens it.
+    if (showZcodeLoginChoice) {
+        AlertDialog(
+            onDismissRequest = { showZcodeLoginChoice = false },
+            title = { Text(stringResource(R.string.zcode_login_choose_title)) },
+            text = {
+                Column {
+                    Text(stringResource(R.string.zcode_login_choose_text))
+                    Spacer(Modifier.height(16.dp))
+                    TextButton(
+                        onClick = {
+                            showZcodeLoginChoice = false
+                            startSignIn(com.openminis.app.auth.ZCodeOAuthManager.LoginProvider.ZAI)
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text(stringResource(R.string.zcode_login_choose_zai)) }
+                    TextButton(
+                        onClick = {
+                            showZcodeLoginChoice = false
+                            startSignIn(com.openminis.app.auth.ZCodeOAuthManager.LoginProvider.BIGMODEL)
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text(stringResource(R.string.zcode_login_choose_bigmodel)) }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { showZcodeLoginChoice = false }) {
+                    Text(stringResource(R.string.common_cancel))
+                }
+            },
+        )
     }
 
     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1194,7 +1249,15 @@ private fun OAuthCredentialBlock(
         ) {
             MinisSmallButton(
                 enabled = !isAuthenticating,
-                onClick = { startSignIn() },
+                // [T-zcode-provider-bigmodel] ZCode asks which account
+                // first; the dialog calls startSignIn with the choice.
+                onClick = {
+                    if (instance.providerType == ProviderType.zcode) {
+                        showZcodeLoginChoice = true
+                    } else {
+                        startSignIn()
+                    }
+                },
             ) {
                 Text(stringResource(R.string.provider_oauth_sign_in_again))
             }
@@ -1207,7 +1270,15 @@ private fun OAuthCredentialBlock(
         MinisSmallButton(
             // Disabled while a sign-in runs, rather than silently ignoring taps.
             enabled = !isAuthenticating,
-            onClick = { startSignIn() },
+            // [T-zcode-provider-bigmodel] ZCode asks which account
+            // first; the dialog calls startSignIn with the choice.
+            onClick = {
+                if (instance.providerType == ProviderType.zcode) {
+                    showZcodeLoginChoice = true
+                } else {
+                    startSignIn()
+                }
+            },
         ) {
             Text(stringResource(R.string.provider_detail_sign_in))
         }

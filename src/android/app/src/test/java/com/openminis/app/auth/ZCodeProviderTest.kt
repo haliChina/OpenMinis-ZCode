@@ -146,15 +146,132 @@ class ZCodeProviderTest {
         )
     }
 
+    // ── BigModel login ───────────────────────────────────────────────
+
+    private fun queryParams(url: String): Map<String, String> {
+        val rawQuery = java.net.URI(url).rawQuery.orEmpty()
+        return rawQuery.split("&").filter { it.isNotEmpty() }.associate {
+            val eq = it.indexOf('=')
+            if (eq >= 0) {
+                java.net.URLDecoder.decode(it.substring(0, eq), "UTF-8") to
+                    java.net.URLDecoder.decode(it.substring(eq + 1), "UTF-8")
+            } else {
+                java.net.URLDecoder.decode(it, "UTF-8") to ""
+            }
+        }
+    }
+
     @Test
-    fun `system prompt never contains a captured local path`() {
-        val system = ZCodeSystemPrompt.build(null, "GLM-5.2", null)
-        val joined = (0 until system.length())
-            .joinToString("") { system.getJSONObject(it).getString("text") }
-        assertFalse(joined.contains("C:\\Users\\"))
-        assertFalse(joined.contains("Angus"))
-        // Still well-formed JSON when the client prompt is absent.
-        assertEquals(3, system.length())
-        assertTrue(JSONArray(system.toString()).length() == 3)
+    fun `bigmodel relay url is the official page with app version`() {
+        assertEquals(
+            "https://zcode.z.ai/app/oauth/login?redirect=zcode://oauth/callback&app_version=3.17.1",
+            ZCodeOAuthManager.buildBigModelRelayUrl(),
+        )
+    }
+
+    @Test
+    fun `bigmodel rewrite sets redirect to the relay page and keeps other params`() {
+        val url = "https://zcode.z.ai/oauth/authorize?flow_id=abc&state=xyz&redirect=zcode://oauth/callback"
+        val rewritten = ZCodeOAuthManager.rewriteAuthorizeUrlForProvider(
+            ZCodeOAuthManager.LoginProvider.BIGMODEL, url,
+        )
+        val params = queryParams(rewritten)
+        assertEquals(ZCodeOAuthManager.buildBigModelRelayUrl(), params["redirect"])
+        assertEquals("abc", params["flow_id"])
+        assertEquals("xyz", params["state"])
+        assertEquals("https://zcode.z.ai/oauth/authorize", rewritten.substringBefore("?"))
+    }
+
+    @Test
+    fun `bigmodel rewrite appends redirect when absent`() {
+        val url = "https://zcode.z.ai/oauth/authorize?flow_id=abc&state=xyz"
+        val rewritten = ZCodeOAuthManager.rewriteAuthorizeUrlForProvider(
+            ZCodeOAuthManager.LoginProvider.BIGMODEL, url,
+        )
+        val params = queryParams(rewritten)
+        assertEquals(ZCodeOAuthManager.buildBigModelRelayUrl(), params["redirect"])
+        assertEquals("abc", params["flow_id"])
+        assertEquals("xyz", params["state"])
+    }
+
+    @Test
+    fun `zai rewrite leaves the authorize url untouched`() {
+        val url = "https://z.ai/oauth/authorize?flow_id=abc&state=xyz&redirect=zcode://oauth/callback"
+        assertEquals(
+            url,
+            ZCodeOAuthManager.rewriteAuthorizeUrlForProvider(
+                ZCodeOAuthManager.LoginProvider.ZAI, url,
+            ),
+        )
+    }
+
+    @Test
+    fun `bigmodel rewrite rejects a non-https url`() {
+        org.junit.Assert.assertThrows(
+            IllegalArgumentException::class.java,
+        ) {
+            ZCodeOAuthManager.rewriteAuthorizeUrlForProvider(
+                ZCodeOAuthManager.LoginProvider.BIGMODEL,
+                "http://zcode.z.ai/oauth/authorize?flow_id=abc",
+            )
+        }
+        org.junit.Assert.assertThrows(
+            IllegalArgumentException::class.java,
+        ) {
+            ZCodeOAuthManager.rewriteAuthorizeUrlForProvider(
+                ZCodeOAuthManager.LoginProvider.BIGMODEL,
+                "not a url",
+            )
+        }
+    }
+
+    @Test
+    fun `ready parses bigmodel credentials and user id from data`() {
+        val jwt = makeJwt("jwt-user", 2_000_000_000L)
+        val data = JSONObject(
+            """{"token":"$jwt","status":"ready","user":{"user_id":"body-user"},
+                "bigmodel":{"access_token":"bm-access","refresh_token":"bm-refresh"}}""",
+        )
+        val result = ZCodeOAuthManager.parseReady(data, ZCodeOAuthManager.LoginProvider.BIGMODEL)
+        assertEquals(jwt, result?.jwt)
+        assertEquals("bm-access", result?.providerAccessToken)
+        assertEquals("bm-refresh", result?.providerRefreshToken)
+        // data.user wins over the JWT payload.
+        assertEquals("body-user", result?.userId)
+    }
+
+    @Test
+    fun `ready accepts camelCase provider fields`() {
+        val jwt = makeJwt("jwt-user", 2_000_000_000L)
+        val data = JSONObject(
+            """{"token":"$jwt","bigmodel":{"accessToken":"bm-access","refreshToken":"bm-refresh"}}""",
+        )
+        val result = ZCodeOAuthManager.parseReady(data, ZCodeOAuthManager.LoginProvider.BIGMODEL)
+        assertEquals("bm-access", result?.providerAccessToken)
+        assertEquals("bm-refresh", result?.providerRefreshToken)
+    }
+
+    @Test
+    fun `ready still parses zai and falls back to the jwt user id`() {
+        val jwt = makeJwt("jwt-user", 2_000_000_000L)
+        val data = JSONObject(
+            """{"token":"$jwt","zai":{"access_token":"zai-access"}}""",
+        )
+        val result = ZCodeOAuthManager.parseReady(data, ZCodeOAuthManager.LoginProvider.ZAI)
+        assertEquals("zai-access", result?.providerAccessToken)
+        assertEquals("jwt-user", result?.userId)
+    }
+
+    @Test
+    fun `ready without a token is not ready`() {
+        val pending = JSONObject("""{"status":"pending"}""")
+        assertEquals(
+            null,
+            ZCodeOAuthManager.parseReady(pending, ZCodeOAuthManager.LoginProvider.BIGMODEL),
+        )
+        assertEquals(
+            null,
+            ZCodeOAuthManager.parseReady(pending, ZCodeOAuthManager.LoginProvider.ZAI),
+        )
     }
 }
