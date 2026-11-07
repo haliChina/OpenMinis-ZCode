@@ -378,4 +378,195 @@ class ZCodeProviderTest {
                 ?.getString("user_id"),
         )
     }
+
+    // ── Activation report ──────────────────────────────────────────────
+
+    private val uuid = Regex(
+        "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    )
+
+    @Test
+    fun `activation events are sent app_launch then app_daily_active`() {
+        assertEquals(
+            listOf("app_launch", "app_daily_active"),
+            ZCodeActivation.ACTIVATION_ELEMENTS,
+        )
+    }
+
+    @Test
+    fun `activation event body has exactly the 16 official fields`() {
+        val body = ZCodeActivation.buildActivationEventBody(
+            elementName = "app_launch",
+            userId = "user-1",
+            deviceMid = "mid-1",
+            clientTimezone = "Asia/Shanghai",
+            clientLanguage = "zh-CN",
+            screenResolution = "1080x2400",
+            osVersion = "14",
+        )
+        val keys = mutableSetOf<String>()
+        val it = body.keys()
+        while (it.hasNext()) keys.add(it.next())
+        assertEquals(
+            setOf(
+                "event_id", "client_timezone", "client_language",
+                "element_name", "event_region", "event_type", "event_text",
+                "event_extra_detail", "user_id", "screen_resolution",
+                "app_version", "device_os_category", "device_os_version",
+                "device_mid", "mac_id", "marketing_params",
+            ),
+            keys,
+        )
+        assertTrue("event_id is a uuid", uuid.matches(body.getString("event_id")))
+        assertEquals("app_launch", body.getString("element_name"))
+        assertEquals("app", body.getString("event_region"))
+        assertEquals("view", body.getString("event_type"))
+        assertEquals("", body.getString("event_text"))
+        assertEquals(0, body.getJSONObject("event_extra_detail").length())
+        assertEquals("user-1", body.getString("user_id"))
+        assertEquals("1080x2400", body.getString("screen_resolution"))
+        assertEquals("3.17.1", body.getString("app_version"))
+        assertEquals("android", body.getString("device_os_category"))
+        assertEquals("14", body.getString("device_os_version"))
+        assertEquals("mid-1", body.getString("device_mid"))
+        assertEquals("", body.getString("mac_id"))
+        assertEquals("{}", body.getString("marketing_params"))
+    }
+
+    @Test
+    fun `activation event ids are fresh per event`() {
+        val first = ZCodeActivation.buildActivationEventBody(
+            "app_launch", "u", "m", "Asia/Shanghai", "zh-CN", "1080x2400", "14",
+        )
+        val second = ZCodeActivation.buildActivationEventBody(
+            "app_daily_active", "u", "m", "Asia/Shanghai", "zh-CN", "1080x2400", "14",
+        )
+        assertEquals("app_daily_active", second.getString("element_name"))
+        assertFalse(first.getString("event_id") == second.getString("event_id"))
+    }
+
+    // ── Preview path ───────────────────────────────────────────────────
+
+    @Test
+    fun `preview path carries app_version and platform`() {
+        assertEquals(
+            "billing/preview?app_version=3.17.1&platform=android-arm64",
+            ZCodeActivation.buildPreviewPath("3.17.1", "android-arm64"),
+        )
+    }
+
+    // ── Preview parsing ────────────────────────────────────────────────
+
+    @Test
+    fun `preview plans parse with priority and name fallbacks`() {
+        val body = """{"code":0,"data":{"plans":[
+            {"plan_id":"p1","show_name":"Start Plan","priority":3},
+            {"plan_id":"p2","name":"Second","priority":1}
+        ]}}"""
+        val plans = ZCodeActivation.parsePreviewPlans(body)
+        assertEquals(listOf("p1", "p2"), plans.map { it.id })
+        assertEquals("Start Plan", plans[0].name)
+        assertEquals("Second", plans[1].name)
+        assertEquals(3, plans[0].priority)
+        assertEquals(ZCodeActivation.ClaimablePlan.Source.PREVIEW, plans[0].source)
+    }
+
+    @Test
+    fun `preview plans fall back to the claimable key`() {
+        val body = """{"code":0,"data":{"claimable":[{"plan_id":"c1"}]}}"""
+        val plans = ZCodeActivation.parsePreviewPlans(body)
+        assertEquals(listOf("c1"), plans.map { it.id })
+        assertEquals("c1", plans[0].name)
+    }
+
+    // ── Touch parsing ──────────────────────────────────────────────────
+
+    private val touchBody = """{"code":0,"data":{"deliveries":[
+        {"id":"d1","content":{"zcode_plan":{
+            "plan_id":"p-touch-1","show_name":"Touch Plan","description":"活动",
+            "priority":5,
+            "entitlements":[
+                {"meter":"model_usage","unit_type":"token","show_name":"GLM-5.3-Flash","grant_units":8000000,"period":"daily"},
+                {"meter":"model_usage","unit_type":"token","showName":"GLM-5.2","grantUnits":1000,"period":"daily"},
+                {"meter":"other","unit_type":"token","show_name":"Nope","grant_units":5},
+                {"meter":"model_usage","unit_type":"call","show_name":"Nope2","grant_units":5}
+            ]
+        }}},
+        {"id":"d2","actions":[{"type":"claim_zcode_plan","args":{"plan_id":"p-action-1"}}]},
+        {"id":"d3","actions":[{"type":"claim_zcode_plan","args":{"planId":"p-touch-1"}}]},
+        {"id":"d4","wrapper":{"inner":{"zcodePlan":{
+            "planId":"p-deep-1","showName":"Deep Plan","priority":2
+        }}}}
+    ]}}"""
+
+    @Test
+    fun `touch deliveries extract plan objects and grants`() {
+        val plans = ZCodeActivation.parseTouchDeliveries(touchBody)
+        // Complete objects in delivery order; synthetic action entries
+        // are appended after the scan (the console sorts by priority
+        // anyway, so this order is only stability, not display order).
+        assertEquals(listOf("p-touch-1", "p-deep-1", "p-action-1"), plans.map { it.id })
+        val touch = plans[0]
+        assertEquals("Touch Plan", touch.name)
+        assertEquals("活动", touch.description)
+        assertEquals(5, touch.priority)
+        assertEquals(ZCodeActivation.ClaimablePlan.Source.TOUCH, touch.source)
+        // Only model_usage + token entitlements survive; snake and camel
+        // keys both read.
+        assertEquals(listOf("GLM-5.3-Flash", "GLM-5.2"), touch.grants.map { it.name })
+        assertEquals(listOf(8000000L, 1000L), touch.grants.map { it.units })
+        assertEquals(listOf("daily", "daily"), touch.grants.map { it.period })
+        // Deep nesting is found by the recursive scan.
+        assertEquals("Deep Plan", plans[1].name)
+        assertEquals(2, plans[1].priority)
+    }
+
+    @Test
+    fun `touch action without a plan object gets a synthetic entry`() {
+        val plans = ZCodeActivation.parseTouchDeliveries(touchBody)
+        val synthetic = plans[2]
+        assertEquals("p-action-1", synthetic.id)
+        assertEquals("p-action-1", synthetic.name)
+        assertEquals("活动投放套餐", synthetic.description)
+        assertEquals(100, synthetic.priority)
+        assertTrue(synthetic.grants.isEmpty())
+        // An action pointing at a plan that already has a complete
+        // object does not duplicate it.
+        assertEquals(1, plans.count { it.id == "p-touch-1" })
+    }
+
+    @Test
+    fun `touch failures yield an empty list`() {
+        assertTrue(ZCodeActivation.parseTouchDeliveries("").isEmpty())
+        assertTrue(ZCodeActivation.parseTouchDeliveries("not json").isEmpty())
+        assertTrue(
+            ZCodeActivation.parseTouchDeliveries("""{"code":1005,"data":{"deliveries":[]}}""").isEmpty(),
+        )
+        assertTrue(
+            ZCodeActivation.parseTouchDeliveries("""{"code":0,"data":{}}""").isEmpty(),
+        )
+    }
+
+    // ── Merge ──────────────────────────────────────────────────────────
+
+    @Test
+    fun `merge dedupes by plan id with preview winning and sorts by priority`() {
+        val preview = listOf(
+            ZCodeActivation.ClaimablePlan("b", "Preview B", priority = 0),
+            ZCodeActivation.ClaimablePlan("a", "Preview A", priority = 5),
+        )
+        val touch = listOf(
+            ZCodeActivation.ClaimablePlan(
+                "b", "Touch B", priority = 9,
+                source = ZCodeActivation.ClaimablePlan.Source.TOUCH,
+            ),
+            ZCodeActivation.ClaimablePlan(
+                "c", "Touch C", priority = 5,
+                source = ZCodeActivation.ClaimablePlan.Source.TOUCH,
+            ),
+        )
+        val merged = ZCodeActivation.mergePlans(preview, touch)
+        assertEquals(listOf("a", "c", "b"), merged.map { it.id })
+        assertEquals("Preview B", merged.first { it.id == "b" }.name)
+    }
 }

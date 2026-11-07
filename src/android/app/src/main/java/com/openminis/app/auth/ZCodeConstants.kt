@@ -42,6 +42,12 @@ object ZCodeConstants {
     /** Client-config endpoint (captcha scene/region/prefix). */
     const val CLIENT_CONFIG_URL = "https://zcode.z.ai/api/v1/client/configs"
 
+    /** Daily-active event report (activation signal before preview). */
+    const val EVENT_REPORT_URL = "https://zcode.z.ai/api/v1/event/report"
+
+    /** Campaign-drop discovery (activity plans, merged with preview). */
+    const val MARKETING_TOUCH_URL = "https://zcode.z.ai/api/v1/marketing/touch?seq=0"
+
     /**
      * Public OAuth client id, published in zai-org/ZCode `.env.example`.
      * It is a PUBLIC client id, not a secret: it is only used by the web

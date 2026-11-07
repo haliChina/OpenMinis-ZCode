@@ -30,6 +30,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import com.openminis.app.auth.ZCodeActivation
 import com.openminis.app.auth.ZCodeCaptchaGate
 import com.openminis.app.auth.ZCodeConstants
 import com.openminis.app.auth.ZCodeOAuthManager
@@ -45,7 +46,11 @@ import org.json.JSONObject
  * background jobs, no auto-claim, no polling:
  *
  *   查额度   GET billing/balance + billing/current (raw values shown)
- *   查可领   GET billing/preview (claimable plans listed to pick from)
+ *   查可领   激活上报（app_launch + app_daily_active）→ GET
+ *            billing/preview（带 app_version/platform）→ GET
+ *            marketing/touch；preview 与 touch 的计划按 plan_id 去重
+ *            合并后列出（活动套餐没有上报就永远投放不下来，见
+ *            ZCodeActivation）。上报失败不阻断继续。
  *   领取     POST billing/claim {"plan_id": <the id the user picked>}
  *
  * One claim = one id, once. The upstream business code is shown with its
@@ -156,25 +161,6 @@ fun ZCodeCaptchaDialog() {
 
 // ── Console section ────────────────────────────────────────────────────
 
-private data class PlanOption(val id: String, val label: String)
-
-private fun parsePreviewPlans(body: String): List<PlanOption> {
-    val out = mutableListOf<PlanOption>()
-    val data = runCatching { JSONObject(body).optJSONObject("data") }.getOrNull() ?: return out
-    val plans = data.optJSONArray("plans") ?: data.optJSONArray("claimable") ?: return out
-    for (i in 0 until plans.length()) {
-        val p = plans.optJSONObject(i) ?: continue
-        val id = p.optString("plan_id", "").ifEmpty { p.optString("id", "") }
-        if (id.isEmpty()) continue
-        val label = p.optString("show_name", "")
-            .ifEmpty { p.optString("name", "") }
-            .ifEmpty { p.optString("title", "") }
-            .ifEmpty { id }
-        out.add(PlanOption(id, label))
-    }
-    return out
-}
-
 private fun parseBalanceSummary(body: String): List<String> {
     val lines = mutableListOf<String>()
     val data = runCatching { JSONObject(body).optJSONObject("data") }.getOrNull() ?: return lines
@@ -230,10 +216,18 @@ fun ColumnScope.ZCodeConsoleSection(
     var balanceResult by remember { mutableStateOf<ZCodeOAuthManager.ApiResult?>(null) }
     var currentResult by remember { mutableStateOf<ZCodeOAuthManager.ApiResult?>(null) }
     var previewResult by remember { mutableStateOf<ZCodeOAuthManager.ApiResult?>(null) }
+    var touchResult by remember { mutableStateOf<ZCodeOAuthManager.ApiResult?>(null) }
+    var activationResult by remember { mutableStateOf<ZCodeActivation.ActivationResult?>(null) }
     var claimResult by remember { mutableStateOf<ZCodeOAuthManager.ApiResult?>(null) }
     var selectedPlanId by remember { mutableStateOf<String?>(null) }
 
-    val previewPlans = previewResult?.let { parsePreviewPlans(it.body) }.orEmpty()
+    // Merged claimable plans: preview + marketing/touch, deduped by
+    // plan_id, priority desc then plan_id asc. Recomputed from the two
+    // raw results on every recomposition — parsing is tiny.
+    val claimablePlans = ZCodeActivation.mergePlans(
+        previewResult?.let { ZCodeActivation.parsePreviewPlans(it.body) }.orEmpty(),
+        touchResult?.let { ZCodeActivation.parseTouchDeliveries(it.body) }.orEmpty(),
+    )
 
     fun runAction(label: String, block: suspend () -> Unit) {
         if (busy != null) return
@@ -252,7 +246,7 @@ fun ColumnScope.ZCodeConsoleSection(
 
     SettingsSection(
         header = "ZCode 控制台",
-        footer = "全部手动操作，无自动领取、无定时刷新。领取只领你在下方选中的一个计划，领一次。",
+        footer = "全部手动操作，无自动领取、无定时刷新。查可领前先上报一次当日活跃（官方客户端同款，用于发现活动套餐）；领取只领你在下方选中的一个计划，领一次。",
     ) {
         SettingsCardBlock {
             androidx.compose.foundation.layout.Column(
@@ -292,11 +286,21 @@ fun ColumnScope.ZCodeConsoleSection(
                 MinisButton(
                     onClick = {
                         runAction("查可领") {
+                            // Activation first (manual tap only, no timer,
+                            // no daily gate — upstream dedupes by device
+                            // + date). A failed report is recorded, not
+                            // fatal: preview and touch still run.
+                            activationResult = manager.reportActivation()
                             previewResult = manager.fetchBillingPreview()
+                            touchResult = manager.fetchMarketingTouch()
                             selectedPlanId = null
                             val r = previewResult!!
-                            statusLine = if (r.captchaCancelled) "已取消验证，未扣额度。"
-                            else "可领计划已读取（HTTP ${r.httpStatus}）。"
+                            val act = activationResult!!
+                            statusLine = "激活上报${act.message}；" + if (r.captchaCancelled) {
+                                "已取消验证，未扣额度。"
+                            } else {
+                                "可领计划已读取（HTTP ${r.httpStatus}）。"
+                            }
                         }
                     },
                     modifier = Modifier.fillMaxWidth(),
@@ -345,13 +349,23 @@ fun ColumnScope.ZCodeConsoleSection(
                         Text(name, style = MaterialTheme.typography.bodyMedium)
                     }
                 }
-                if (previewPlans.isNotEmpty()) {
+                if (claimablePlans.isNotEmpty()) {
                     Spacer(Modifier.height(8.dp))
                     Text("可领计划（点选一个，再按“领取选中计划”）", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    previewPlans.forEach { plan ->
+                    claimablePlans.forEach { plan ->
+                        val subtitle = buildString {
+                            append(plan.id)
+                            if (plan.description.isNotEmpty()) append(" · ${plan.description}")
+                            if (plan.grants.isNotEmpty()) {
+                                append(" · ")
+                                append(plan.grants.joinToString(", ") { grant ->
+                                    "${grant.name.ifEmpty { "额度" }} ${grant.units}"
+                                })
+                            }
+                        }
                         SettingsRow(
-                            title = plan.label,
-                            subtitle = plan.id,
+                            title = plan.name,
+                            subtitle = subtitle,
                             onClick = { selectedPlanId = plan.id },
                             showDivider = false,
                         )
@@ -383,6 +397,38 @@ fun ColumnScope.ZCodeConsoleSection(
                     ) {
                         Text(
                             balanceResult!!.body.take(4000),
+                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                if (previewResult != null) {
+                    Spacer(Modifier.height(8.dp))
+                    Text("可领原始返回", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    androidx.compose.foundation.layout.Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(160.dp)
+                            .verticalScroll(rememberScrollState()),
+                    ) {
+                        Text(
+                            previewResult!!.body.take(4000),
+                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                if (touchResult != null) {
+                    Spacer(Modifier.height(8.dp))
+                    Text("活动发现原始返回", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    androidx.compose.foundation.layout.Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(160.dp)
+                            .verticalScroll(rememberScrollState()),
+                    ) {
+                        Text(
+                            touchResult!!.body.take(4000).ifEmpty { "（空）" },
                             style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )

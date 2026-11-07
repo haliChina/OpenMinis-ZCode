@@ -269,6 +269,16 @@ class ZCodeOAuthManager(
         }
 
         /**
+         * The X-Platform value, e.g. "android-arm64". Shared by the
+         * identity headers and the preview query parameter — the two must
+         * agree, they describe the same phone.
+         */
+        fun currentPlatform(): String {
+            val abi = android.os.Build.SUPPORTED_ABIS.firstOrNull().orEmpty()
+            return "android-${archLabel(abi)}"
+        }
+
+        /**
          * Identity headers from this phone's real values: first ABI in
          * [android.os.Build.SUPPORTED_ABIS], [android.os.Build.VERSION.RELEASE],
          * the default locale's language tag and the default timezone id.
@@ -276,10 +286,9 @@ class ZCodeOAuthManager(
          * are shared and unit-tested.
          */
         fun currentIdentityHeaders(deviceMid: String): Map<String, String> {
-            val abi = android.os.Build.SUPPORTED_ABIS.firstOrNull().orEmpty()
             return buildIdentityHeaders(
                 deviceMid = deviceMid,
-                platform = "android-${archLabel(abi)}",
+                platform = currentPlatform(),
                 osVersion = android.os.Build.VERSION.RELEASE ?: "",
                 clientLanguage = java.util.Locale.getDefault().toLanguageTag(),
                 clientTimezone = java.util.TimeZone.getDefault().id,
@@ -561,7 +570,116 @@ class ZCodeOAuthManager(
 
     suspend fun fetchBillingBalance(): ApiResult = billingAuthed("GET", "billing/balance", null)
     suspend fun fetchBillingCurrent(): ApiResult = billingAuthed("GET", "billing/current", null)
-    suspend fun fetchBillingPreview(): ApiResult = billingAuthed("GET", "billing/preview", null)
+
+    /** Preview carries the query parameters upstream wants
+     *  (app_version + platform, same platform value as X-Platform). */
+    suspend fun fetchBillingPreview(): ApiResult = billingAuthed(
+        "GET",
+        ZCodeActivation.buildPreviewPath(
+            ZCodeConstants.CLIENT_APP_VERSION,
+            currentPlatform(),
+        ),
+        null,
+    )
+
+    /**
+     * GET marketing/touch — the campaign-drop discovery channel. Never
+     * throws and never triggers a captcha dialog: any failure (no login,
+     * network, HTTP, business code) is reported as an empty result and
+     * the caller falls back to the preview list alone. The raw body is
+     * still returned on HTTP responses so the console can show it.
+     */
+    suspend fun fetchMarketingTouch(): ApiResult = withContext(Dispatchers.IO) {
+        runCatching {
+            val jwt = validAccessToken() ?: return@withContext ApiResult(0, null, "")
+            val builder = Request.Builder()
+                .url(ZCodeConstants.MARKETING_TOUCH_URL)
+                .get()
+            applyBillingHeaders(builder, jwt)
+            val response = httpClient.newCall(builder.build()).execute()
+            val status = response.code
+            val body = response.body?.string().orEmpty()
+            response.close()
+            val code = runCatching { JSONObject(body).optInt("code", -1) }.getOrDefault(-1)
+                .takeIf { it >= 0 }
+            ApiResult(status, code, body)
+        }.getOrElse { ApiResult(0, null, "") }
+    }
+
+    /**
+     * Daily-active activation report: the two events the official client
+     * sends before preview (`app_launch`, then `app_daily_active`).
+     * Upstream dedupes by device_mid + date, so there is no local
+     * once-a-day gate — this runs on every manual 查可领 tap and the
+     * server ignores repeats. The first event failing aborts the second.
+     * Never throws and never blocks the caller: a failure is reported in
+     * the returned [ZCodeActivation.ActivationResult] and the console
+     * continues to preview anyway.
+     */
+    suspend fun reportActivation(): ZCodeActivation.ActivationResult =
+        withContext(Dispatchers.IO) {
+            val total = ZCodeActivation.ACTIVATION_ELEMENTS.size
+            try {
+                val jwt = validAccessToken()
+                    ?: return@withContext ZCodeActivation.ActivationResult(0, total, "失败：未登录")
+                val userId = jwtUserId(jwt)
+                    ?: return@withContext ZCodeActivation.ActivationResult(0, total, "失败：token 里没有 user_id")
+                val mid = deviceMid()
+                val timezone = java.util.TimeZone.getDefault().id
+                val language = java.util.Locale.getDefault().toLanguageTag()
+                val resolution = screenResolution()
+                val osVersion = android.os.Build.VERSION.RELEASE ?: ""
+                var sent = 0
+                for (element in ZCodeActivation.ACTIVATION_ELEMENTS) {
+                    val body = ZCodeActivation.buildActivationEventBody(
+                        elementName = element,
+                        userId = userId,
+                        deviceMid = mid,
+                        clientTimezone = timezone,
+                        clientLanguage = language,
+                        screenResolution = resolution,
+                        osVersion = osVersion,
+                    )
+                    val failure = postActivationEvent(body)
+                    if (failure != null) {
+                        return@withContext ZCodeActivation.ActivationResult(
+                            sent, total, "失败：$element $failure",
+                        )
+                    }
+                    sent++
+                }
+                ZCodeActivation.ActivationResult(sent, total, "成功（$sent/$total）")
+            } catch (e: Exception) {
+                ZCodeActivation.ActivationResult(
+                    0, total, "失败：${e.message?.take(120) ?: "网络异常"}",
+                )
+            }
+        }
+
+    /** One activation event POST. No Authorization header — the event is
+     *  keyed by device_mid + user_id in the body. Returns null on
+     *  success (HTTP < 400 and code == 0), a short failure reason
+     *  otherwise. */
+    private fun postActivationEvent(body: JSONObject): String? {
+        val request = Request.Builder()
+            .url(ZCodeConstants.EVENT_REPORT_URL)
+            .post(body.toString().toRequestBody(JSON_MEDIA))
+            .header("Content-Type", "application/json")
+            .build()
+        val response = httpClient.newCall(request).execute()
+        val status = response.code
+        val respBody = response.body?.string().orEmpty()
+        response.close()
+        if (status >= 400) return "HTTP $status"
+        val code = runCatching { JSONObject(respBody).optInt("code", -1) }.getOrDefault(-1)
+        return if (code == 0) null else "code=$code"
+    }
+
+    /** "1080x2400" from the real display metrics. */
+    private fun screenResolution(): String {
+        val dm = context.resources.displayMetrics
+        return "${dm.widthPixels}x${dm.heightPixels}"
+    }
 
     /** POST billing/claim {"plan_id": id}. One id, once — the caller
      *  chooses the id from the preview; nothing here auto-selects or
@@ -610,17 +728,13 @@ class ZCodeOAuthManager(
      * headers do not have one). Captcha verify headers are added on the
      * retry only, as before.
      */
-    private fun executeBilling(
-        method: String,
-        path: String,
-        jwt: String,
-        jsonBody: JSONObject?,
-        verifyParam: String?,
-        region: String?,
-    ): ApiResult {
-        val builder = Request.Builder()
-            .url("${ZCodeConstants.PLAN_BASE}/$path")
-            .header("Authorization", "Bearer $jwt")
+    /**
+     * Shared billing header set (gateway `_auth_headers`): identity +
+     * client-version/referer/title/channel + a fresh x-request-id per
+     * request. Used by [executeBilling] and the marketing/touch call.
+     */
+    private fun applyBillingHeaders(builder: Request.Builder, jwt: String) {
+        builder.header("Authorization", "Bearer $jwt")
             .header("Content-Type", "application/json")
             .header("User-Agent", "ZCode/${ZCodeConstants.CLIENT_APP_VERSION}")
             .header("HTTP-Referer", "https://zcode.z.ai")
@@ -631,6 +745,19 @@ class ZCodeOAuthManager(
         for ((name, value) in currentIdentityHeaders(deviceMid())) {
             builder.header(name, value)
         }
+    }
+
+    private fun executeBilling(
+        method: String,
+        path: String,
+        jwt: String,
+        jsonBody: JSONObject?,
+        verifyParam: String?,
+        region: String?,
+    ): ApiResult {
+        val builder = Request.Builder()
+            .url("${ZCodeConstants.PLAN_BASE}/$path")
+        applyBillingHeaders(builder, jwt)
         if (verifyParam != null) {
             builder.header("X-Aliyun-Captcha-Verify-Param", verifyParam)
             if (!region.isNullOrBlank()) builder.header("X-Aliyun-Captcha-Verify-Region", region)
