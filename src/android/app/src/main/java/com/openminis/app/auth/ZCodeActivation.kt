@@ -27,10 +27,10 @@ import java.util.UUID
  */
 object ZCodeActivation {
 
-    /** The two events, in the order the official client sends them. */
-    val ACTIVATION_ELEMENTS: List<String> = listOf("app_launch", "app_daily_active")
+    /** The three events, in the order the official client sends them. */
+    val ACTIVATION_ELEMENTS: List<String> = listOf("app_launch", "app_daily_active", "app_login_success")
 
-    /** One activation report run: how many of the two events upstream
+    /** One activation report run: how many of the three events upstream
      *  accepted, and a one-line outcome for the console. Never throws. */
     data class ActivationResult(
         val sent: Int,
@@ -65,7 +65,10 @@ object ZCodeActivation {
      * one of [ACTIVATION_ELEMENTS]; [screenResolution] is e.g.
      * "1080x2400"; [appVersion] defaults to [ZCodeConstants.CLIENT_APP_VERSION].
      * `event_extra_detail` is an empty object and `marketing_params` is
-     * the literal string "{}" — both are what the gateway sends.
+     * the literal string "{}" — both are what the gateway sends — except
+     * for `app_login_success`, where `event_region` is "app_profile" and
+     * `event_extra_detail` carries `{"login_provider": [loginProvider]}`
+     * (zcode-pool sends this third event on every claim refresh).
      */
     fun buildActivationEventBody(
         elementName: String,
@@ -76,15 +79,28 @@ object ZCodeActivation {
         screenResolution: String,
         osVersion: String,
         appVersion: String = ZCodeConstants.CLIENT_APP_VERSION,
+        loginProvider: String = "zai",
     ): JSONObject = JSONObject().apply {
+        // [T-zcode-provider] zcode-pool sends a third event,
+        // app_login_success, on every claim refresh: same 16 fields, but
+        // event_region is "app_profile" and event_extra_detail carries the
+        // login provider. The other two events keep "app" and an empty object.
+        val isLoginSuccess = elementName == "app_login_success"
         put("event_id", UUID.randomUUID().toString())
         put("client_timezone", clientTimezone)
         put("client_language", clientLanguage)
         put("element_name", elementName)
-        put("event_region", "app")
+        put("event_region", if (isLoginSuccess) "app_profile" else "app")
         put("event_type", "view")
         put("event_text", "")
-        put("event_extra_detail", JSONObject())
+        put(
+            "event_extra_detail",
+            if (isLoginSuccess) {
+                JSONObject().apply { put("login_provider", loginProvider) }
+            } else {
+                JSONObject()
+            },
+        )
         put("user_id", userId)
         put("screen_resolution", screenResolution)
         put("app_version", appVersion)

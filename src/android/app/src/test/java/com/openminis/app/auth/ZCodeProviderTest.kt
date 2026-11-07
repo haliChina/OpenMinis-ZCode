@@ -386,11 +386,61 @@ class ZCodeProviderTest {
     )
 
     @Test
-    fun `activation events are sent app_launch then app_daily_active`() {
+    fun `activation events are sent app_launch, app_daily_active, then app_login_success`() {
         assertEquals(
-            listOf("app_launch", "app_daily_active"),
+            listOf("app_launch", "app_daily_active", "app_login_success"),
             ZCodeActivation.ACTIVATION_ELEMENTS,
         )
+    }
+
+    @Test
+    fun `app_login_success body uses app_profile region and carries the login provider`() {
+        val body = ZCodeActivation.buildActivationEventBody(
+            elementName = "app_login_success",
+            userId = "user-1",
+            deviceMid = "mid-1",
+            clientTimezone = "Asia/Shanghai",
+            clientLanguage = "zh-CN",
+            screenResolution = "1080x2400",
+            osVersion = "14",
+        )
+        assertEquals("app_login_success", body.getString("element_name"))
+        assertEquals("app_profile", body.getString("event_region"))
+        assertEquals("zai", body.getJSONObject("event_extra_detail").getString("login_provider"))
+    }
+
+    @Test
+    fun `app_login_success body carries bigmodel when that is the login provider`() {
+        val body = ZCodeActivation.buildActivationEventBody(
+            elementName = "app_login_success",
+            userId = "user-1",
+            deviceMid = "mid-1",
+            clientTimezone = "Asia/Shanghai",
+            clientLanguage = "zh-CN",
+            screenResolution = "1080x2400",
+            osVersion = "14",
+            loginProvider = "bigmodel",
+        )
+        assertEquals("app_profile", body.getString("event_region"))
+        assertEquals("bigmodel", body.getJSONObject("event_extra_detail").getString("login_provider"))
+    }
+
+    @Test
+    fun `app_launch and app_daily_active bodies keep app region and empty extra detail`() {
+        for (element in listOf("app_launch", "app_daily_active")) {
+            val body = ZCodeActivation.buildActivationEventBody(
+                elementName = element,
+                userId = "user-1",
+                deviceMid = "mid-1",
+                clientTimezone = "Asia/Shanghai",
+                clientLanguage = "zh-CN",
+                screenResolution = "1080x2400",
+                osVersion = "14",
+            )
+            assertEquals(element, body.getString("element_name"))
+            assertEquals("app", body.getString("event_region"))
+            assertEquals(0, body.getJSONObject("event_extra_detail").length())
+        }
     }
 
     @Test

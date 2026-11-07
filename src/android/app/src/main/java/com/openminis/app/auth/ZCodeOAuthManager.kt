@@ -607,14 +607,14 @@ class ZCodeOAuthManager(
     }
 
     /**
-     * Daily-active activation report: the two events the official client
-     * sends before preview (`app_launch`, then `app_daily_active`).
-     * Upstream dedupes by device_mid + date, so there is no local
-     * once-a-day gate — this runs on every manual 查可领 tap and the
-     * server ignores repeats. The first event failing aborts the second.
-     * Never throws and never blocks the caller: a failure is reported in
-     * the returned [ZCodeActivation.ActivationResult] and the console
-     * continues to preview anyway.
+     * Daily-active activation report: the three events the official client
+     * sends before preview (`app_launch`, `app_daily_active`, then
+     * `app_login_success`). Upstream dedupes by device_mid + date, so
+     * there is no local once-a-day gate — this runs on every manual 查可领
+     * tap and the server ignores repeats. The first event failing aborts
+     * the rest. Never throws and never blocks the caller: a failure is
+     * reported in the returned [ZCodeActivation.ActivationResult] and the
+     * console continues to preview anyway.
      */
     suspend fun reportActivation(): ZCodeActivation.ActivationResult =
         withContext(Dispatchers.IO) {
@@ -625,6 +625,13 @@ class ZCodeOAuthManager(
                 val userId = jwtUserId(jwt)
                     ?: return@withContext ZCodeActivation.ActivationResult(0, total, "失败：token 里没有 user_id")
                 val mid = deviceMid()
+                // The login provider recorded at sign-in (token blob
+                // "login_provider": LoginProvider.id, "zai" or "bigmodel").
+                // Normalized through fromId so a missing or unknown value
+                // falls back to "zai" — never the enum name, never hardcoded.
+                val loginProviderId = LoginProvider.fromId(
+                    loadStoredTokens()?.optString("login_provider", "").orEmpty(),
+                ).id
                 val timezone = java.util.TimeZone.getDefault().id
                 val language = java.util.Locale.getDefault().toLanguageTag()
                 val resolution = screenResolution()
@@ -639,6 +646,7 @@ class ZCodeOAuthManager(
                         clientLanguage = language,
                         screenResolution = resolution,
                         osVersion = osVersion,
+                        loginProvider = loginProviderId,
                     )
                     val failure = postActivationEvent(body)
                     if (failure != null) {

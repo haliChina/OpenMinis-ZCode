@@ -46,7 +46,7 @@ import org.json.JSONObject
  * background jobs, no auto-claim, no polling:
  *
  *   查额度   GET billing/balance + billing/current (raw values shown)
- *   查可领   激活上报（app_launch + app_daily_active）→ GET
+ *   查可领   激活上报（app_launch + app_daily_active + app_login_success）→ GET
  *            billing/preview（带 app_version/platform）→ GET
  *            marketing/touch；preview 与 touch 的计划按 plan_id 去重
  *            合并后列出（活动套餐没有上报就永远投放不下来，见
