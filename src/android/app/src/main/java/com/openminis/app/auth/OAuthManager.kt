@@ -159,6 +159,10 @@ abstract class OAuthManager(
                 // token it hands out is Copilot's short-lived session token.
                 com.openminis.app.data.model.ProviderType.githubCopilot ->
                     CopilotOAuthManager(context, instance.id)
+                // [T-zcode-provider] CLI init/poll OAuth; hands out the plan
+                // JWT directly (no second tier, no refresh).
+                com.openminis.app.data.model.ProviderType.zcode ->
+                    ZCodeOAuthManager(context, instance.id)
                 else -> null
             }
         }

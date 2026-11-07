@@ -1,5 +1,6 @@
 package com.openminis.app.ui.settings
 
+import android.net.Uri
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -35,6 +36,7 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -48,6 +50,7 @@ import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -66,6 +69,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.res.stringResource
+import com.openminis.app.auth.OAuthTabLauncher
 import com.openminis.app.data.model.ProviderType
 import com.openminis.app.data.repository.ProviderRepository
 import com.openminis.app.logging.AppLogger
@@ -279,7 +283,11 @@ fun ProviderDetailScreen(
         // the session-token minter. A token pasted here was stored, shown as
         // configured, and then ignored on every request — a dead end that looks
         // like a feature. Mirrors iOS ProviderInstanceDetailView.
-        if (isOAuthProvider && instance.providerType != ProviderType.githubCopilot) {
+        //
+        // [T-zcode-provider] Same exclusion for ZCode: the factory reads the
+        // JWT from the OAuth manager, never a manual bearer.
+        if (isOAuthProvider && instance.providerType != ProviderType.githubCopilot &&
+            instance.providerType != ProviderType.zcode) {
             SettingsSection(
                 header = stringResource(R.string.provider_detail_manual_bearer_token),
                 footer = stringResource(R.string.provider_detail_use_a_static_bearer_token_instead_of_the) +
@@ -292,6 +300,14 @@ fun ProviderDetailScreen(
                     )
                 }
             }
+        }
+
+        // ─── ZCode console (manual quota / claim) ───────────────────────
+        // [T-zcode-provider] Only for ZCode instances. All actions are
+        // manual buttons; this section also hosts the manual captcha
+        // dialog shared with chat requests.
+        if (instance.providerType == ProviderType.zcode) {
+            ZCodeConsoleSection(instance = instance, providerRepository = providerRepository)
         }
 
         // ─── Custom Base URL ────────────────────────────────────────
@@ -978,6 +994,32 @@ private fun OAuthCredentialBlock(
         )
     }
 
+    // [T-zcode-provider] Waiting state for the CLI init/poll re-login.
+    var zcodeAuth by remember(instance.id) {
+        mutableStateOf<com.openminis.app.auth.ZCodeOAuthManager.InitResult?>(null)
+    }
+    zcodeAuth?.let { init ->
+        AlertDialog(
+            onDismissRequest = {
+                kimiLoginJob?.cancel()
+                zcodeAuth = null
+            },
+            title = { Text(stringResource(R.string.zcode_login_title)) },
+            text = { Text(stringResource(R.string.zcode_login_instructions)) },
+            confirmButton = {
+                TextButton(onClick = {
+                    OAuthTabLauncher.launch(context, Uri.parse(init.authorizeUrl))
+                }) { Text(stringResource(R.string.zcode_login_open_browser)) }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    kimiLoginJob?.cancel()
+                    zcodeAuth = null
+                }) { Text(stringResource(R.string.common_cancel)) }
+            },
+        )
+    }
+
     // [T-oauth-keep-credentials] Refresh rejected: the credential is kept (never
     // auto-deleted) but unusable until the user signs in again.
     var needsReauth by remember(instance.id) {
@@ -1014,13 +1056,33 @@ private fun OAuthCredentialBlock(
                         com.openminis.app.auth.XAIOAuthManager.login(
                             context, instance.id, providerRepository,
                         )
+                    ProviderType.zcode -> {
+                        // [T-zcode-provider] CLI init/poll re-login; the
+                        // JWT is persisted by the manager, not mirrored
+                        // into the api-key store.
+                        val mgr = com.openminis.app.auth.ZCodeOAuthManager(
+                            context, instance.id,
+                        )
+                        val init = mgr.beginLogin()
+                        zcodeAuth = init
+                        OAuthTabLauncher.launch(context, Uri.parse(init.authorizeUrl))
+                        mgr.finishLogin(init).also { zcodeAuth = null }
+                    }
                     else -> null
                 }
                 // login() persists the token via providerRepository.saveApiKey;
                 // reflect it locally so the UI flips to the connected state
                 // without needing the parent to recompose.
+                //
+                // [T-zcode-provider] ZCode persists the JWT in the OAuth
+                // token blob, not the api-key store — show the connected
+                // placeholder, never the raw JWT, in this row's state.
                 if (token != null) {
-                    displayedKey = providerRepository.loadApiKey(instance.id) ?: token
+                    displayedKey = if (instance.providerType == ProviderType.zcode) {
+                        OAUTH_CONNECTED_PLACEHOLDER
+                    } else {
+                        providerRepository.loadApiKey(instance.id) ?: token
+                    }
                     needsReauth = false
                     AppLogger.info(TAG, "OAuth signed in for ${instance.id}")
                     // [T-provider-refresh-outlives-screen] (GH#265) A fresh
@@ -1048,6 +1110,7 @@ private fun OAuthCredentialBlock(
             } finally {
                 isAuthenticating = false
                 kimiDeviceAuth = null
+                zcodeAuth = null
                 com.openminis.app.auth.OAuthForegroundGate.end()
             }
         }

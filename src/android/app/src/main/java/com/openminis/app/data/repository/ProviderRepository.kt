@@ -2641,9 +2641,24 @@ class ProviderRepository(private val context: Context) {
             }
         }
 
+        // [T-zcode-provider] Same shape as Copilot: ZCode holds no API key,
+        // the JWT lives in the OAuth manager's token blob. Resolved here
+        // into the local `apiKey` only so Step 1 runs — the ZCode branch
+        // below ignores the value and returns the plan-filtered built-in
+        // catalog. Deliberately NOT mirrored into the api-key store.
+        if (instance.providerType == ProviderType.zcode && apiKey == null) {
+            apiKey = try {
+                com.openminis.app.auth.ZCodeOAuthManager(context, instance.id).validAccessToken()
+            } catch (e: Exception) {
+                android.util.Log.w("ProviderRepo", "ZCode JWT unavailable: ${e.message}")
+                null
+            }
+        }
+
         // For OAuth providers, try to refresh the token before using it (mirrors iOS validAccessToken)
         if (instance.credentialType == com.openminis.app.data.model.ProviderCredential.oauth &&
-            apiKey != null && instance.providerType != ProviderType.githubCopilot
+            apiKey != null && instance.providerType != ProviderType.githubCopilot &&
+            instance.providerType != ProviderType.zcode
         ) {
             try {
                 val manager = com.openminis.app.auth.OAuthManager.forInstance(context, instance)
@@ -2844,6 +2859,18 @@ class ProviderRepository(private val context: Context) {
                                     )
                                 }
                         }
+                    }
+                    // [T-zcode-provider] No /v1/models endpoint on the plan
+                    // channel; the catalog is the built-in list filtered by
+                    // the stored plan mode (Start Plan has no GLM-5.3).
+                    // Never falls through to models.dev: z.ai is not in its
+                    // registry, and a wrong-vendor list would offer models
+                    // this account cannot use.
+                    ProviderType.zcode -> {
+                        val mode = if (context != null) {
+                            com.openminis.app.auth.ZCodeOAuthManager(context, instance.id).planMode()
+                        } else com.openminis.app.auth.ZCodeConstants.PlanMode.UNKNOWN
+                        com.openminis.app.auth.ZCodeConstants.modelsForPlan(mode)
                     }
                     // [T-android-provider-type-parity] No models endpoint to
                     // query for a type this build cannot drive; the instance
@@ -3125,6 +3152,10 @@ class ProviderRepository(private val context: Context) {
             // [T-copilot-provider] No /v1 suffix — Copilot serves
             // /chat/completions and /models straight off the API root.
             ProviderType.githubCopilot -> com.openminis.app.auth.CopilotDeviceFlow.API_BASE
+            // [T-zcode-provider] Plan channel base; only used as the
+            // models.dev lookup key (which has no z.ai entry, so a refresh
+            // that reaches Step 3 keeps the existing list).
+            ProviderType.zcode -> com.openminis.app.auth.ZCodeConstants.PLAN_BASE
             // No canonical host for a type this build cannot drive. Callers
             // reaching here have already exhausted effectiveBaseURL.
             ProviderType.antigravity, ProviderType.unsupported -> "https://api.openai.com/v1"
@@ -3209,6 +3240,7 @@ class ProviderRepository(private val context: Context) {
         ProviderType.xAI -> com.openminis.app.auth.XAIOAuthManager(context, instance.id)
         ProviderType.gemini -> com.openminis.app.auth.GeminiOAuthManager(context, instance.id)
         ProviderType.kimiCode -> com.openminis.app.auth.KimiOAuthManager(context, instance.id)
+        ProviderType.zcode -> com.openminis.app.auth.ZCodeOAuthManager(context, instance.id)
         else -> null
     }
 

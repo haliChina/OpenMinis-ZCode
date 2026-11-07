@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="referrer" content="no-referrer">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZCode 验证</title>
+<style>
+  body { margin: 0; padding: 16px; font-family: sans-serif; background: #fff; color: #222; }
+  #status { font-size: 14px; color: #666; margin-bottom: 12px; }
+  #cap-btn { display: none; }
+  #retry-btn { display: none; margin-top: 12px; padding: 8px 16px; font-size: 15px; }
+</style>
+</head>
+<body>
+<div id="status">正在加载验证…</div>
+<div id="cap-holder"></div>
+<button id="cap-btn">verify</button>
+<button id="retry-btn" type="button">重试验证</button>
+<script src="https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js"></script>
+<script>
+(function () {
+  var lastConfig = null;
+  var started = false;
+
+  function setStatus(text) {
+    var el = document.getElementById('status');
+    if (el) el.textContent = text;
+  }
+
+  function start(config) {
+    lastConfig = config;
+    document.getElementById('retry-btn').style.display = 'none';
+    if (typeof window.initAliyunCaptcha !== 'function') {
+      setStatus('验证组件加载失败，请检查网络后重试。');
+      document.getElementById('retry-btn').style.display = 'inline-block';
+      return;
+    }
+    // Region/prefix are set the way the official client does it: the
+    // global AliyunCaptchaConfig carries them, SceneId goes to init.
+    window.AliyunCaptchaConfig = { region: config.region, prefix: config.prefix };
+    setStatus('正在验证…如果需要，请在弹出的窗口中完成滑块 / 拼图。');
+    try {
+      window.initAliyunCaptcha({
+        SceneId: config.sceneId,
+        mode: 'popup',
+        language: 'zh-CN',
+        showErrorTip: false,
+        element: '#cap-holder',
+        button: '#cap-btn',
+        getInstance: function (instance) {
+          try { instance.startTracelessVerification(); }
+          catch (e) { onFail('启动验证失败'); }
+        },
+        success: function (p) {
+          var v = typeof p === 'string' ? p : (p && p.captchaVerifyParam);
+          if (v) {
+            setStatus('验证通过，正在继续…');
+            if (window.ZCodeCaptcha && window.ZCodeCaptcha.onVerifyParam) {
+              window.ZCodeCaptcha.onVerifyParam(v);
+            }
+          } else {
+            onFail('验证未返回凭证');
+          }
+        },
+        fail: function () { onFail('验证未通过，请重试。'); },
+        onError: function () { onFail('验证出错，请重试。'); }
+      });
+    } catch (e) {
+      onFail('初始化验证失败');
+    }
+  }
+
+  function onFail(message) {
+    setStatus(message);
+    document.getElementById('retry-btn').style.display = 'inline-block';
+    if (window.ZCodeCaptcha && window.ZCodeCaptcha.onError) {
+      window.ZCodeCaptcha.onError(message);
+    }
+  }
+
+  document.getElementById('retry-btn').addEventListener('click', function () {
+    if (lastConfig) start(lastConfig);
+  });
+
+  // Called by the app once the page (and the Aliyun SDK) has loaded.
+  window.startZCodeCaptcha = function (config) {
+    if (started) return;
+    started = true;
+    start(config);
+  };
+  window.retryZCodeCaptcha = function () {
+    if (lastConfig) start(lastConfig);
+  };
+})();
+</script>
+</body>
+</html>

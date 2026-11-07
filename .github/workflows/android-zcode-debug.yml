@@ -1,0 +1,94 @@
+# Build OpenMinis Android (githubDebug) with the built-in ZCode provider.
+#
+# Runs on GitHub Actions because the local build VM cannot run Gradle:
+# the sandbox blocks the JVM's loopback TCP connection to its daemon.
+#
+# Steps follow BUILDING.md / README.md exactly (do not skip the native
+# dependency steps — the APK will not build or run without them):
+#   1. ./deps/build_proot.sh && ./scripts/prepare_android_sandbox.sh
+#      (NDK r28+ cross-compiles proot + loaders; Alpine minirootfs download)
+#   2. ./deps/build_rclone_android.sh (+ copy rclone.aar to app/libs/)
+#      (Go 1.25+ + gomobile; backup destinations fail to link without it)
+#   3. ./gradlew :app:testGithubDebugUnitTest (ZCode unit tests only)
+#   4. ./gradlew :app:assembleGithubDebug
+#
+# Toolchain versions are pinned to what the repo requires:
+# JDK 17, Gradle 8.11.1 (wrapper), AGP 8.7.3, Kotlin 2.1.0,
+# compileSdk 36, NDK r28 (28.2.13676358), CMake 3.22.1, Go 1.25+.
+
+name: Android ZCode debug build
+
+on:
+  push:
+    branches: [feat/zcode-android]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      ANDROID_NDK_VERSION: 28.2.13676358
+    steps:
+      - name: Check out (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Go 1.25
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK r28, CMake 3.22.1, platforms, build-tools
+        run: |
+          sdkmanager "ndk;${ANDROID_NDK_VERSION}" "cmake;3.22.1" \
+            "platforms;android-36" "platforms;android-35" "build-tools;36.0.0"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Install gomobile
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          gomobile init
+
+      - name: Copy build-time customization template (empty values build fine)
+        run: |
+          cp src/android/app/provider-customization.properties.example \
+             src/android/app/provider-customization.properties
+
+      - name: Build proot + prepare Android sandbox assets
+        run: |
+          ./deps/build_proot.sh
+          ./scripts/prepare_android_sandbox.sh
+
+      - name: Build rclone AAR
+        run: |
+          ./deps/build_rclone_android.sh
+          mkdir -p src/android/app/libs
+          cp deps/build/rclone/rclone.aar src/android/app/libs/
+
+      - name: Run ZCode unit tests
+        working-directory: src/android
+        run: ./gradlew :app:testGithubDebugUnitTest --tests "com.openminis.app.auth.ZCodeProviderTest" --no-daemon --console=plain
+
+      - name: Assemble githubDebug APK
+        working-directory: src/android
+        run: ./gradlew :app:assembleGithubDebug --no-daemon --console=plain
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-github-debug
+          path: |
+            src/android/app/build/outputs/apk/github/debug/app-github-debug.apk
+            src/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error

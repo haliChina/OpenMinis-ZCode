@@ -2379,6 +2379,12 @@
     <string name="add_provider_subtitle_copilot">Sign in with GitHub — unofficial, use at your own risk</string>
     <string name="copilot_login_title">Sign in with GitHub</string>
     <string name="copilot_login_instructions">Open the verification page and enter this code to link your GitHub account:</string>
+    <!-- [T-zcode-provider] ZCode built-in provider -->
+    <string name="add_provider_subtitle_zcode">Sign in with ZCode — free Start Plan quota, direct in-app</string>
+    <string name="zcode_login_title">Sign in with ZCode</string>
+    <string name="zcode_login_instructions">A browser page has opened. Sign in with your z.ai account there and authorize Minis. This screen will continue automatically once you authorize (up to 5 minutes).</string>
+    <string name="zcode_login_open_browser">Open in browser</string>
+    <string name="zcode_risk_notice">ZCode’s free quota is an official-client entitlement. Driving it from a third-party client may breach the provider’s terms and risk rate limiting or suspension of your account. Use only your own account.</string>
     <string name="copilot_disclaimer_title">Notice regarding unofficial access</string>
     <string name="copilot_disclaimer_p1">This sign-in method is not officially authorized. Minis is not affiliated with, endorsed by, or supported by GitHub, and this integration has not been reviewed or approved by GitHub.</string>
     <string name="copilot_disclaimer_p2">Authorization is performed using a client identity issued to a third-party developer tool rather than to Minis, and it relies on service interfaces that are not published for this purpose.</string>

@@ -1,5 +1,6 @@
 package com.openminis.app.ui.settings
 
+import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -31,12 +32,14 @@ import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Diamond
 import androidx.compose.material.icons.filled.FlashOn
 import androidx.compose.material.icons.filled.Hub
+import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.outlined.GraphicEq
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -49,6 +52,7 @@ import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -68,6 +72,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.res.stringResource
+import com.openminis.app.auth.OAuthTabLauncher
 import com.openminis.app.auth.OpenAIOAuthManager
 import com.openminis.app.auth.OpenRouterOAuthManager
 import com.openminis.app.data.model.ProviderCredential
@@ -206,6 +211,8 @@ private fun providerIcon(type: ProviderType): Pair<ImageVector, Color> = when (t
     ProviderType.kimiCode -> Icons.Default.Terminal to Color(0xFF5C6BC0)
     // [T-copilot-provider] GitHub purple.
     ProviderType.githubCopilot -> Icons.Default.Terminal to Color(0xFF6E5494)
+    // [T-zcode-provider] ZCode blue.
+    ProviderType.zcode -> Icons.Default.Code to Color(0xFF1565C0)
     // [T-android-provider-type-parity] Types that arrive only from an iOS
     // package / newer build; never offered in addableProviderTypes, but the
     // icon helper is also used to render an already-restored instance.
@@ -233,6 +240,9 @@ private fun availableCredentials(type: ProviderType): List<ProviderCredential> {
         // for the Copilot chat endpoint — offering a key field would invite
         // people to paste a GitHub PAT, which the endpoint rejects.
         ProviderType.githubCopilot -> listOf(ProviderCredential.oauth)
+        // [T-zcode-provider] OAuth ONLY. The plan channel takes the login
+        // JWT; there is no user-obtainable API key for it.
+        ProviderType.zcode -> listOf(ProviderCredential.oauth)
         // [T-android-provider-type-parity] Responses API instances authenticate
         // exactly like OpenAI ones (API key, or a Codex OAuth login).
         ProviderType.openAIResponses -> listOf(ProviderCredential.apiKey, ProviderCredential.oauth)
@@ -272,7 +282,7 @@ private fun ChooseProviderScreen(
         // actually matters, since it stands between the user and the first
         // request.
         val context = LocalContext.current
-        val offeredTypes = providerDisplayOrder + ProviderType.githubCopilot
+        val offeredTypes = providerDisplayOrder + ProviderType.githubCopilot + ProviderType.zcode
         SettingsSection(
             header = stringResource(R.string.add_provider_choose_provider),
             footer = stringResource(R.string.add_provider_you_can_add_multiple_instances_of_the_sa),
@@ -286,6 +296,7 @@ private fun ChooseProviderScreen(
                     ProviderType.xAI -> "xAI (Grok)"
                     ProviderType.kimiCode -> "Kimi Code"
                     ProviderType.githubCopilot -> "GitHub Copilot"
+                    ProviderType.zcode -> "ZCode"
                     // [T-android-provider-type-parity] Fall back to the enum's
                     // own display name for types this screen doesn't curate.
                     ProviderType.openAIResponses,
@@ -302,6 +313,7 @@ private fun ChooseProviderScreen(
                     ProviderType.xAI -> R.string.add_provider_subtitle_xai
                     ProviderType.kimiCode -> R.string.add_provider_subtitle_kimi
                     ProviderType.githubCopilot -> R.string.add_provider_subtitle_copilot
+                    ProviderType.zcode -> R.string.add_provider_subtitle_zcode
                     // [T-android-provider-type-parity] Not offered for
                     // creation; reuse the OpenAI copy for the Responses API and
                     // a generic line for the undrivable types.
@@ -409,6 +421,8 @@ private fun apiKeyDescription(type: ProviderType): String = when (type) {
     // [T-copilot-provider] Never offered (availableCredentials returns OAuth
     // only); present because this helper is total over the enum.
     ProviderType.githubCopilot -> "GitHub Copilot requires signing in with GitHub"
+    // [T-zcode-provider] Same: OAuth only, no API-key path exists.
+    ProviderType.zcode -> "ZCode requires signing in with your z.ai account"
     ProviderType.openAIResponses -> "Supports the OpenAI Responses API and compatible endpoints"
     ProviderType.antigravity,
     ProviderType.unsupported -> "This provider type is not supported on Android"
@@ -422,6 +436,7 @@ private fun oauthDescription(type: ProviderType): String = when (type) {
     ProviderType.openRouter -> "Sign in with OpenRouter"
     ProviderType.kimiCode -> "Sign in with your Kimi account (Coding Plan)"
     ProviderType.githubCopilot -> "Sign in with GitHub (requires a Copilot subscription)"
+    ProviderType.zcode -> "Sign in with ZCode (z.ai account)"
     ProviderType.openAIResponses -> "Sign in with OpenAI Codex"
     ProviderType.antigravity,
     ProviderType.unsupported -> "This provider type is not supported on Android"
@@ -553,6 +568,8 @@ private fun ColumnScope.ApiKeyConfigSection(
         ProviderType.kimiCode -> "sk-..."
         // Unreachable: Copilot offers no API-key credential.
         ProviderType.githubCopilot -> ""
+        // Unreachable: ZCode offers no API-key credential.
+        ProviderType.zcode -> ""
         ProviderType.openAIResponses -> "sk-..."
         ProviderType.antigravity,
         ProviderType.unsupported -> "API Key..."
@@ -734,6 +751,7 @@ private fun ColumnScope.OAuthConfigSection(
         ProviderType.xAI -> "Sign in with xAI"
         ProviderType.kimiCode -> "Sign in with Kimi Code"
         ProviderType.githubCopilot -> "Sign in with GitHub"
+        ProviderType.zcode -> "Sign in with ZCode"
         ProviderType.openAIResponses -> "Sign in with OpenAI"
         ProviderType.antigravity,
         ProviderType.unsupported -> "Sign in"
@@ -767,6 +785,45 @@ private fun ColumnScope.OAuthConfigSection(
     // [T-copilot-disclaimer] Gate state for the pre-login notice. Declared
     // before the sign-in section so both the button and the sheet see it.
     var showCopilotDisclaimer by remember { mutableStateOf(false) }
+
+    // [T-zcode-provider] Waiting state for the CLI init/poll login: set
+    // once init returns, cleared when polling finishes or is cancelled.
+    // The dialog shows the authorize URL and lets the user re-open it if
+    // the Custom Tab did not come to the front.
+    var zcodeAuth by remember {
+        mutableStateOf<com.openminis.app.auth.ZCodeOAuthManager.InitResult?>(null)
+    }
+    zcodeAuth?.let { init ->
+        AlertDialog(
+            onDismissRequest = {
+                kimiLoginJob?.cancel()
+                zcodeAuth = null
+            },
+            title = { Text(stringResource(R.string.zcode_login_title)) },
+            text = {
+                Column {
+                    Text(stringResource(R.string.zcode_login_instructions))
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        stringResource(R.string.zcode_risk_notice),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    OAuthTabLauncher.launch(context, Uri.parse(init.authorizeUrl))
+                }) { Text(stringResource(R.string.zcode_login_open_browser)) }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    kimiLoginJob?.cancel()
+                    zcodeAuth = null
+                }) { Text(stringResource(R.string.common_cancel)) }
+            },
+        )
+    }
 
     copilotDeviceAuth?.let { auth ->
         KimiDeviceLoginDialog(
@@ -896,6 +953,24 @@ private fun ColumnScope.OAuthConfigSection(
                                         copilotDeviceAuth = null
                                         maskedToken = maskOAuthToken(key)
                                     }
+                                    ProviderType.zcode -> {
+                                        // [T-zcode-provider] CLI init/poll:
+                                        // init, open the authorize URL in a
+                                        // Custom Tab, poll until the user
+                                        // authorizes (300s). No localhost
+                                        // callback server on this path.
+                                        val mgr = com.openminis.app.auth.ZCodeOAuthManager(
+                                            context, pendingInstanceId,
+                                        )
+                                        val init = mgr.beginLogin()
+                                        zcodeAuth = init
+                                        OAuthTabLauncher.launch(
+                                            context, Uri.parse(init.authorizeUrl),
+                                        )
+                                        val key = mgr.finishLogin(init)
+                                        zcodeAuth = null
+                                        maskedToken = maskOAuthToken(key)
+                                    }
                                     ProviderType.openRouter -> {
                                         val key = OpenRouterOAuthManager.login(context, pendingInstanceId, providerRepository)
                                         maskedToken = maskOAuthToken(key)
@@ -922,10 +997,12 @@ private fun ColumnScope.OAuthConfigSection(
                                 // dialog — not an error; just reset the button.
                                 kimiDeviceAuth = null
                                 copilotDeviceAuth = null
+                                zcodeAuth = null
                                 throw e
                             } catch (e: Exception) {
                                 kimiDeviceAuth = null
                                 copilotDeviceAuth = null
+                                zcodeAuth = null
                                 // T-android-codex-oauth-dns: surface a
                                 // localized "check network / proxy" hint
                                 // when the OAuth manager flags a DNS /
@@ -1007,6 +1084,18 @@ private fun ColumnScope.OAuthConfigSection(
                         Text(signInLabel)
                     }
                 }
+                // [T-zcode-provider] Risk notice on the sign-in screen
+                // itself (no separate disclaimer dialog): the free plan is
+                // an official-client entitlement, and driving it from a
+                // third-party client may breach the provider's terms.
+                if (providerType == ProviderType.zcode) {
+                    Spacer(Modifier.height(12.dp))
+                    Text(
+                        stringResource(R.string.zcode_risk_notice),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
                 if (errorMessage != null) {
                     Spacer(Modifier.height(8.dp))
                     Text(
@@ -1030,7 +1119,11 @@ private fun ColumnScope.OAuthConfigSection(
         // `customBaseURLSupported = false` and excludes it from the manual
         // token entry for the same reasons. Showing fields that are stored,
         // displayed as configured, and then ignored is worse than showing none.
-        if (providerType != ProviderType.githubCopilot) {
+        //
+        // [T-zcode-provider] Same exclusion for ZCode: the factory never
+        // reads a manual bearer or a custom base URL for it — the JWT comes
+        // from the OAuth manager and the host is fixed.
+        if (providerType != ProviderType.githubCopilot && providerType != ProviderType.zcode) {
         val defaultUrl = when (providerType) {
             ProviderType.gemini -> "https://generativelanguage.googleapis.com/v1beta"
             ProviderType.anthropic -> "https://api.anthropic.com"
@@ -1042,6 +1135,9 @@ private fun ColumnScope.OAuthConfigSection(
             // [T-copilot-provider] API root, no /v1 — /chat/completions and
             // /models both hang directly off it.
             ProviderType.githubCopilot -> com.openminis.app.auth.CopilotDeviceFlow.API_BASE
+            // [T-zcode-provider] Unreachable (manual section is hidden for
+            // ZCode); present because this helper is total over the enum.
+            ProviderType.zcode -> ""
             ProviderType.openAIResponses -> "https://api.openai.com"
             ProviderType.antigravity,
             ProviderType.unsupported -> ""

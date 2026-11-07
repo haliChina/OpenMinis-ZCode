@@ -276,6 +276,24 @@ object ProviderFactory {
                     }
                 }
             }
+            ProviderType.zcode -> {
+                // [T-zcode-provider] Built-in ZCode: direct to the free
+                // Start Plan channel. The JWT comes from ZCodeOAuthManager
+                // (lazy, expiry-checked, no refresh); without a context
+                // there is no token store to read, so fail as uncredentialed
+                // rather than building a provider that emits bare requests.
+                if (context == null) throw com.openminis.app.data.model.LLMError.InvalidApiKey()
+                val oauthManager = com.openminis.app.auth.ZCodeOAuthManager(context, instance.id)
+                com.openminis.app.provider.zcode.ZCodeProvider(
+                    jwtProvider = {
+                        oauthManager.validAccessToken()
+                            ?: throw com.openminis.app.data.model.LLMError.InvalidApiKey()
+                    },
+                    model = model,
+                    instanceId = instance.id,
+                    captchaConfigProvider = { oauthManager.fetchCaptchaConfig() },
+                )
+            }
             // [T-android-provider-type-parity] Types this build can decode and
             // display but not drive. Reaching here means the user selected a
             // model on an instance restored from another platform (or a newer

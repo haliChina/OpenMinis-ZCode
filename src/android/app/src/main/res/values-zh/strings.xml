@@ -2178,6 +2178,12 @@
     <string name="add_provider_subtitle_copilot">使用 GitHub 账号登录 — 非官方接入，风险自负</string>
     <string name="copilot_login_title">使用 GitHub 登录</string>
     <string name="copilot_login_instructions">打开验证页面并输入此代码，以关联你的 GitHub 账号：</string>
+    <!-- [T-zcode-provider] ZCode 内置提供商 -->
+    <string name="add_provider_subtitle_zcode">使用 ZCode 登录 — 免费 Start Plan 额度，App 内直连</string>
+    <string name="zcode_login_title">使用 ZCode 登录</string>
+    <string name="zcode_login_instructions">浏览器页面已打开，请在那里用 z.ai 账号登录并授权 Minis。授权完成后本页会自动继续（最多等待 5 分钟）。</string>
+    <string name="zcode_login_open_browser">在浏览器中打开</string>
+    <string name="zcode_risk_notice">ZCode 免费额度是官方客户端内的权益，用第三方客户端调用可能违反服务条款，并可能导致账号限流或停用。请只用你自己的账号。</string>
     <string name="copilot_disclaimer_title">关于非官方接入的声明</string>
     <string name="copilot_disclaimer_p1">此登录方式未获官方授权。Minis 与 GitHub 无从属关系，未获其认可或支持，本接入也未经 GitHub 审核或批准。</string>
     <string name="copilot_disclaimer_p2">授权使用的是发给第三方开发者工具的客户端身份，而非 Minis 自己的身份，并依赖未公开用于此用途的服务接口。</string>

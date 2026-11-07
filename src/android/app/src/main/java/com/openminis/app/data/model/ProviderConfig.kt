@@ -37,6 +37,19 @@ enum class ProviderType(val displayName: String) {
      */
     githubCopilot("GitHub Copilot"),
 
+    /**
+     * [T-zcode-provider] ZCode (z.ai) via the CLI init/poll OAuth flow.
+     * Chat goes straight to the free Start Plan channel
+     * (`zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages`); there is no
+     * API-key path — offering one would invite pasting a JWT as a key.
+     * Single account, JWT in EncryptedPrefs, no refresh (expired = re-login).
+     *
+     * Appended last — DB round-trips are name-based, so adding a case is
+     * migration-safe. iOS has no such case yet, so an instance restored on
+     * iOS decodes as `unsupported` there (documented limitation).
+     */
+    zcode("ZCode"),
+
     // [T-android-provider-type-parity] The cases below exist on iOS but were
     // missing here. They are declared so a cross-platform restore or sync can
     // DECODE them: without a case, kotlinx.serialization throws on the unknown
@@ -87,7 +100,7 @@ enum class ProviderType(val displayName: String) {
             // openAIResponses included: it routes through the OpenAI provider
             // with the Responses endpoint forced on.
             anthropic, gemini, openAI, openRouter, xAI, kimiCode, openAIResponses,
-            githubCopilot -> true
+            githubCopilot, zcode -> true
             antigravity, unsupported -> false
         }
 
@@ -99,6 +112,10 @@ enum class ProviderType(val displayName: String) {
             openRouter -> LLMModel.allOpenRouter
             xAI -> LLMModel.allXAI
             kimiCode -> LLMModel.allKimi
+            // [T-zcode-provider] Built-in catalog is the full list; the
+            // plan filter (Start Plan has no GLM-5.3) is applied by the
+            // model refresh, which knows the account's plan mode.
+            zcode -> LLMModel.allZCode
             // No built-in catalog for the decode-only types; models restored
             // alongside the instance still appear as custom entries.
             // [T-copilot-provider] Copilot's catalog is fetched live from

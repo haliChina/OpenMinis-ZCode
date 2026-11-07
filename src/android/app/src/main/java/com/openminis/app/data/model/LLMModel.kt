@@ -233,7 +233,21 @@ data class LLMModel(
 
         val allKimi = listOf(kimiK3, kimiK2)
 
-        val allModels = allAnthropic + allGemini + allOpenAI + allOpenRouter + allXAI + allKimi
+        // [T-zcode-provider] ZCode built-in fallback. Ids and windows from
+        // zai-org/ZCode config/provider/zcode-builtin.json (revision 43):
+        // GLM-5.3 1M ctx / 128K out, GLM-5.2 1M / 128K, GLM-5-Turbo
+        // 200K / 64K, GLM-5.3-Flash inherits 1M (not separately overridden
+        // in the file). Start Plan offers Flash / 5.2 / Turbo only — NO
+        // GLM-5.3 — so the plan-filtered list lives alongside the full one.
+        val zcodeFlash = LLMModel("GLM-5.3-Flash", "GLM-5.3-Flash", "ZCode", contextWindow = 1_000_000, maxOutputTokens = 128_000)
+        val zcode53 = LLMModel("GLM-5.3", "GLM-5.3", "ZCode", contextWindow = 1_000_000, maxOutputTokens = 128_000)
+        val zcode52 = LLMModel("GLM-5.2", "GLM-5.2", "ZCode", contextWindow = 1_000_000, maxOutputTokens = 128_000)
+        val zcodeTurbo = LLMModel("GLM-5-Turbo", "GLM-5-Turbo", "ZCode", contextWindow = 200_000, maxOutputTokens = 64_000)
+
+        val allZCode = listOf(zcodeFlash, zcode53, zcode52, zcodeTurbo)
+        val allZCodeStartPlan = listOf(zcodeFlash, zcode52, zcodeTurbo)
+
+        val allModels = allAnthropic + allGemini + allOpenAI + allOpenRouter + allXAI + allKimi + allZCode
 
         /**
          * Heuristic display-name formatter for API model ids.
