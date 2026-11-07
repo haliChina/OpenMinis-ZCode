@@ -148,8 +148,18 @@ android {
         create("github") {
             dimension = "distribution"
             isDefault = true
-            buildConfigField("boolean", "SELF_UPDATE", "true")
-            buildConfigField("boolean", "AUTO_UPDATE_CHECK", "true")
+            // [T-zcode-coexist] This fork ships a side-by-side build: a
+            // different applicationId so it installs NEXT TO the official
+            // Minis (same package name cannot coexist), a distinct launcher
+            // name, and no self-update — upstream releases carry the
+            // official package name and could never install over this one.
+            // Authorities (`${applicationId}.fileprovider/.shizuku`) and all
+            // runtime uses of the package name are dynamic, so only the
+            // flavor config changes here.
+            applicationIdSuffix = ".zcode"
+            resValue("string", "app_name", "Minis ZCode")
+            buildConfigField("boolean", "SELF_UPDATE", "false")
+            buildConfigField("boolean", "AUTO_UPDATE_CHECK", "false")
             buildConfigField("boolean", "IN_APP_INSTALL", "true")
         }
         create("store") {
