@@ -30,8 +30,10 @@ abstract class OAuthManager(
      */
     protected val netTag: String get() = com.openminis.app.network.NetworkRuntime.providerTag(instanceId)
 
-    /** [baseHttpClient], routed by [netTag]; the same object when nothing is configured. */
-    protected val httpClient: OkHttpClient get() = com.openminis.app.network.NetworkHttp.client(netTag, baseHttpClient)
+    /** [baseHttpClient], routed by [netTag]; the same object when nothing is configured.
+     *  Open so a test subclass can replace the HTTP layer with a canned
+     *  client (the production path is untouched). */
+    protected open val httpClient: OkHttpClient get() = com.openminis.app.network.NetworkHttp.client(netTag, baseHttpClient)
 
     companion object {
         private const val TAG = "OAuthManager"

@@ -91,6 +91,9 @@ class ZCodeProvider(
      *  per-instance id. */
     private val deviceMidProvider: (() -> String)? = null,
     private val workingDirectory: String? = null,
+    /** Test seam: replaces the default OkHttp client (still routed
+     *  through NetworkHttp.client); null keeps the production client. */
+    httpClient: OkHttpClient? = null,
 ) : LLMProvider, com.openminis.app.network.NetworkTagged {
 
     override val name = "ZCode"
@@ -98,7 +101,7 @@ class ZCodeProvider(
 
     override var netTag: String? = null
 
-    private val baseClient = OkHttpClient.Builder()
+    private val baseClient = httpClient ?: OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(10, TimeUnit.MINUTES)
         .writeTimeout(30, TimeUnit.SECONDS)

@@ -57,7 +57,10 @@ import java.security.SecureRandom
  * with 3012 when the identity set is incomplete. Values are the
  * phone's own, never a desktop spoof.
  */
-class ZCodeOAuthManager(
+/** Open so tests can subclass it and replace the HTTP layer via the
+ *  open [OAuthManager.httpClient] seam (production code never subclasses
+ *  this manager). */
+open class ZCodeOAuthManager(
     context: Context,
     instanceId: String,
 ) : OAuthManager(context, instanceId) {
