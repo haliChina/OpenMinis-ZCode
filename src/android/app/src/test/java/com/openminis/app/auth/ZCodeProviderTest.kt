@@ -1,7 +1,19 @@
 package com.openminis.app.auth
 
+import android.content.Context
+import com.openminis.app.data.model.LLMError
+import com.openminis.app.data.model.LLMMessage
+import com.openminis.app.data.model.ThinkingLevel
+import com.openminis.app.network.NetworkHttp
 import com.openminis.app.provider.zcode.ZCodeChatWire
+import com.openminis.app.provider.zcode.ZCodeProvider
 import com.openminis.app.provider.zcode.ZCodeSystemPrompt
+import kotlinx.coroutines.runBlocking
+import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.Protocol
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -975,5 +987,122 @@ class ZCodeProviderTest {
         assertTrue(ZCodeCaptchaGate.isParamFresh(now - 39_000, now))
         assertFalse(ZCodeCaptchaGate.isParamFresh(now - 41_000, now))
         assertFalse(ZCodeCaptchaGate.isParamFresh(0, now))
+    }
+
+    // ── billing vs model captcha skip (2026-11-08 user report) ───────
+
+    private fun cannedResponse(request: okhttp3.Request, code: Int, body: String): Response =
+        Response.Builder()
+            .request(request)
+            .protocol(Protocol.HTTP_1_1)
+            .code(code)
+            .message("OK")
+            .body(body.toResponseBody("application/json".toMediaType()))
+            .build()
+
+    @Test
+    fun `billing claim still opens the captcha dialog when skipModelRequest is true`() {
+        // Regression (user report 2026-11-08): billingRaw consulted
+        // skip_model_request and returned the raw 3007, so the claim
+        // dialog never opened. skip_model_request is for MODEL requests
+        // only — a claim 3007 must still reach requestVerification and
+        // retry once with the param. In the harness no dialog is mounted,
+        // so requestVerification resolves from the prefetched param cache;
+        // the observable proof is the retry itself (verify header
+        // present, code 0, retriedWithCaptcha) — on the old code the
+        // result would be the raw 3007 with no retry at all.
+        val seen = mutableListOf<String>()
+        NetworkHttp.testInterceptor = Interceptor { chain ->
+            val req = chain.request()
+            val url = req.url.toString()
+            when {
+                url.contains("client/configs") -> {
+                    seen.add("configs")
+                    cannedResponse(
+                        req, 200,
+                        """{"code":0,"data":{"configs":{"captcha":{"sceneId":"11xygtvd","region":"sgp","prefix":"no8xfe","skip_model_request":true,"enabled":true}}}}""",
+                    )
+                }
+                url.contains("billing/claim") && req.header("X-Aliyun-Captcha-Verify-Param") != null -> {
+                    seen.add("claim+verify:" + req.header("X-Aliyun-Captcha-Verify-Param"))
+                    cannedResponse(
+                        req, 200,
+                        """{"code":0,"data":{"plan":{"plan_id":"zcode-v3-start-plan-0817","show_name":"Start"}}}""",
+                    )
+                }
+                url.contains("billing/claim") -> {
+                    seen.add("claim")
+                    cannedResponse(req, 200, """{"code":3007,"msg":"captcha required"}""")
+                }
+                else -> cannedResponse(req, 404, """{"code":404,"msg":"unexpected call: $url"}""")
+            }
+        }
+        val manager = ZCodeOAuthManager(Context(), "test-billing-3007")
+        manager.saveManualBearerToken("test-jwt")
+        ZCodeCaptchaGate.cachePrefetchedParam("verify-param-test")
+        try {
+            val result = runBlocking { manager.claimPlan("zcode-v3-start-plan-0817") }
+            assertEquals(0, result.code)
+            assertTrue(result.retriedWithCaptcha)
+            assertEquals(
+                listOf("claim", "configs", "claim+verify:verify-param-test"),
+                seen,
+            )
+        } finally {
+            NetworkHttp.testInterceptor = null
+        }
+    }
+
+    @Test
+    fun `model request with skipModelRequest true returns the raw 3007 without a dialog`() {
+        // The chat path (ZCodeProvider.executeWithCaptchaRetry) must keep
+        // honouring skip_model_request: a 3007 there returns the upstream
+        // error as-is — no dialog, no retry. Guards the billing fix
+        // against being "fixed" by deleting the flag everywhere.
+        val seen = mutableListOf<String>()
+        NetworkHttp.testInterceptor = Interceptor { chain ->
+            val req = chain.request()
+            val url = req.url.toString()
+            if (url.contains("anthropic/v1/messages")) {
+                seen.add("chat" + if (req.header("X-Aliyun-Captcha-Verify-Param") != null) "+verify" else "")
+                cannedResponse(req, 403, """{"code":3007,"msg":"captcha required"}""")
+            } else {
+                cannedResponse(req, 404, """{"code":404,"msg":"unexpected call: $url"}""")
+            }
+        }
+        val jwt = makeJwt("user-1", 3600)
+        val provider = ZCodeProvider(
+            jwtProvider = { jwt },
+            instanceId = "test-model-3007",
+            captchaConfigProvider = {
+                ZCodeCaptchaGate.Config(
+                    sceneId = "11xygtvd", region = "sgp", prefix = "no8xfe",
+                    skipModelRequest = true,
+                )
+            },
+        )
+        try {
+            var thrown: Throwable? = null
+            try {
+                runBlocking {
+                    provider.sendMessageClamped(
+                        messages = listOf(LLMMessage(LLMMessage.Role.USER, "hi")),
+                        systemPrompt = null,
+                        maxTokens = 100,
+                        temperature = null,
+                        imageParts = emptyList(),
+                        tools = emptyList(),
+                        thinkingLevel = ThinkingLevel.OFF,
+                    )
+                }
+            } catch (e: Throwable) {
+                thrown = e
+            }
+            assertTrue(thrown is LLMError)
+            assertEquals(listOf("chat"), seen)
+            assertEquals(null, ZCodeCaptchaGate.pending.value)
+        } finally {
+            NetworkHttp.testInterceptor = null
+        }
     }
 }

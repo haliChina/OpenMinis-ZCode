@@ -880,10 +880,11 @@ class ZCodeOAuthManager(
     /**
      * One billing call with a 429 backoff retry table (#12) and at most
      * one manual-captcha retry. On a challenge the user is asked once
-     * via [ZCodeCaptchaGate] — unless the live config says model
-     * requests skip verification ([ZCodeCaptchaGate.Config.skipModelRequest],
-     * #16), in which case no dialog is opened at all. Cancel (or no
-     * dialog mounted) returns the ORIGINAL result with
+     * via [ZCodeCaptchaGate]. Note [ZCodeCaptchaGate.Config.skipModelRequest]
+     * ("model requests skip verification", #16) applies to MODEL requests
+     * (chat) only — billing calls (claim, balance, preview) still open
+     * the dialog once and retry once on a 3007. Cancel (or no dialog
+     * mounted) returns the ORIGINAL result with
      * [ApiResult.captchaCancelled] set — the caller reports "已取消，未扣额度".
      * 3012 is never retried: it is not a captcha challenge and a fresh
      * param does not help.
@@ -909,7 +910,10 @@ class ZCodeOAuthManager(
         if (!allowCaptchaRetry || !first.captchaChallenge) return@withContext first
         val config = runCatching { fetchCaptchaConfig(jwt) }
             .getOrDefault(ZCodeCaptchaGate.Config.FALLBACK)
-        if (config.skipModelRequest) return@withContext first
+        // NOTE: skipModelRequest is NOT consulted here — it means "model
+        // requests skip verification" (chat only). Billing calls always
+        // open the dialog once on a 3007; consulting it here used to
+        // swallow the claim 3007 and return the raw error with no dialog.
         val param = ZCodeCaptchaGate.requestVerification(config)
             ?: return@withContext first.copy(captchaCancelled = true)
         // Param is single-use and ~40s TTL (#15): use it immediately, once.

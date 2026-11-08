@@ -40,7 +40,10 @@ object ZCodeCaptchaGate {
         /** Live `configs.captcha.skip_model_request` (verified true on
          *  2026-11-07): when true, model requests are sent without a
          *  verify param and a 3007 must NOT open the dialog — the user
-         *  is not asked to verify something upstream says to skip. */
+         *  is not asked to verify something upstream says to skip.
+         *  Billing calls are NOT model requests: claim/balance/preview
+         *  still open the dialog on a 3007 (ZCodeOAuthManager.billingRaw)
+         *  — never consult this flag on the billing path. */
         val skipModelRequest: Boolean = false,
         /** Live `configs.captcha.enabled`. */
         val enabled: Boolean = true,
