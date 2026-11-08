@@ -331,7 +331,14 @@ open class ZCodeOAuthManager(
          * agree, they describe the same phone.
          */
         fun currentPlatform(): String {
-            val abi = android.os.Build.SUPPORTED_ABIS.firstOrNull().orEmpty()
+            // AGP unit tests run against a stub android.jar whose static
+            // fields are null (VERSION.RELEASE is already guarded with
+            // ?: "" at both call sites); SUPPORTED_ABIS is a Java
+            // platform type, so an unguarded dereference compiles and
+            // throws NPE in CI while the harness stub (non-null array)
+            // lets it pass. Safe-call it: on a real device the array
+            // is never null, so behaviour there is unchanged.
+            val abi = android.os.Build.SUPPORTED_ABIS?.firstOrNull().orEmpty()
             return "android-${archLabel(abi)}"
         }
 
