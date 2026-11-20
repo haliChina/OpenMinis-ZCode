@@ -441,7 +441,33 @@ private fun SkillImportSheet(
             // (scripts/, references/, assets/) are the common case on iOS;
             // matching here aligns Android with iOS
             // `SkillsManagementView.documentPicker` + `SkillStore.importFromArchive`.
-            val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+            // [T-attachment-ingest-io] Bounded read: readBytes() loaded the
+            // whole picked file into memory, so a multi-GB pick OOM-crashed
+            // the import (OutOfMemoryError is an Error — the catch below only
+            // sees Exception). Skill bundles are text + small assets; 50MB is
+            // far beyond a plausible one.
+            val maxSkillImportBytes = 50L * 1024 * 1024
+            var importTooLarge = false
+            val bytes = context.contentResolver.openInputStream(uri)?.use { input ->
+                val out = java.io.ByteArrayOutputStream()
+                val buf = ByteArray(64 * 1024)
+                var total = 0L
+                var n = input.read(buf)
+                while (n >= 0) {
+                    total += n
+                    if (total > maxSkillImportBytes) {
+                        importTooLarge = true
+                        break
+                    }
+                    out.write(buf, 0, n)
+                    n = input.read(buf)
+                }
+                if (importTooLarge) null else out.toByteArray()
+            }
+            if (importTooLarge) {
+                errorText = "File is too large to import (limit 50 MB)"
+                return@rememberLauncherForActivityResult
+            }
             if (bytes == null) {
                 errorText = "Failed to read file"
                 return@rememberLauncherForActivityResult
