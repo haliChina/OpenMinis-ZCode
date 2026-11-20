@@ -1172,8 +1172,11 @@ class ZCodeProviderTest {
 
     // ── Thinking fields (official per-model contract) ──────────────────
     // Shapes from zcode-builtin.json modelApiRules (anthropic-messages):
-    // GLM-5.3 family always thinks with an effort tier, GLM-5.2 adds an
-    // explicit disabled state, GLM-5-Turbo is a bare toggle.
+    // GLM-5.3 family always thinks with an effort tier, GLM-5.2 thinks
+    // with an effort tier whose lowest rung is high, GLM-5-Turbo is a
+    // bare toggle — and OFF resolves to each family's official default
+    // tier (the last declared option), because Minis cannot tell
+    // "never chosen" from "chosen off" at the provider boundary.
 
     @Test
     fun `glm-5_3 sends enabled thinking with the snapped effort`() {
@@ -1198,19 +1201,24 @@ class ZCodeProviderTest {
     }
 
     @Test
-    fun `glm-5_3 off sends no thinking fields at all`() {
-        // The family declares no disabled level; OFF keeps the exact
-        // pre-thinking wire shape rather than inventing a literal.
+    fun `glm-5_3 off resolves to the official default tier`() {
+        // OFF is the official default (the family's last option,
+        // max): Minis cannot distinguish "never chosen" from "chosen
+        // off" at this seam, and the official client defaults a
+        // missing reasoningLevel instead of omitting the fields.
         val off = ZCodeChatWire.buildThinkingFields("GLM-5.3-Flash", ThinkingLevel.OFF)
-        assertFalse(off.has("thinking"))
-        assertFalse(off.has("output_config"))
+        assertEquals("enabled", off.getJSONObject("thinking").getString("type"))
+        assertEquals("max", off.getJSONObject("output_config").getString("effort"))
     }
 
     @Test
-    fun `glm-5_2 off is the explicit disabled literal`() {
+    fun `glm-5_2 off resolves to the official default tier`() {
+        // OFF lands on the family default (max), exactly like MAX
+        // itself; the family's disabled literal is unreachable now
+        // that OFF carries the official default (see ZCodeChatWire).
         val off = ZCodeChatWire.buildThinkingFields("GLM-5.2", ThinkingLevel.OFF)
-        assertEquals("disabled", off.getJSONObject("thinking").getString("type"))
-        assertFalse(off.has("output_config"))
+        assertEquals("enabled", off.getJSONObject("thinking").getString("type"))
+        assertEquals("max", off.getJSONObject("output_config").getString("effort"))
         val high = ZCodeChatWire.buildThinkingFields("GLM-5.2", ThinkingLevel.HIGH)
         assertEquals("enabled", high.getJSONObject("thinking").getString("type"))
         assertEquals("high", high.getJSONObject("output_config").getString("effort"))
@@ -1232,8 +1240,11 @@ class ZCodeProviderTest {
         val on = ZCodeChatWire.buildThinkingFields("GLM-5-Turbo", ThinkingLevel.HIGH)
         assertEquals("enabled", on.getJSONObject("thinking").getString("type"))
         assertFalse(on.has("output_config"))
+        // OFF is the family default (enabled) too — the toggle
+        // family's last declared option; its disabled literal is
+        // unreachable now that OFF carries the official default.
         val off = ZCodeChatWire.buildThinkingFields("GLM-5-Turbo", ThinkingLevel.OFF)
-        assertEquals("disabled", off.getJSONObject("thinking").getString("type"))
+        assertEquals("enabled", off.getJSONObject("thinking").getString("type"))
         assertFalse(off.has("output_config"))
     }
 
@@ -1291,7 +1302,7 @@ class ZCodeProviderTest {
     }
 
     @Test
-    fun `chat request at OFF carries no thinking fields on glm-5_3`() {
+    fun `chat request at OFF carries the official default thinking on glm-5_3`() {
         val captured = mutableListOf<JSONObject>()
         val provider = ZCodeProvider(
             jwtProvider = { makeJwt("user-1", 3600) },
@@ -1316,12 +1327,15 @@ class ZCodeProviderTest {
             )
         }
         assertEquals(1, captured.size)
-        assertFalse(captured.single().has("thinking"))
-        assertFalse(captured.single().has("output_config"))
+        // OFF resolves to the family default (enabled at max) — the
+        // request thinks by default, exactly like the official client.
+        val body = captured.single()
+        assertEquals("enabled", body.getJSONObject("thinking").getString("type"))
+        assertEquals("max", body.getJSONObject("output_config").getString("effort"))
     }
 
     @Test
-    fun `streaming request carries the disabled literal at OFF on glm-5-turbo`() {
+    fun `streaming request at OFF carries enabled thinking on glm-5-turbo`() {
         val captured = mutableListOf<JSONObject>()
         val sse = buildString {
             append("data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n")
@@ -1348,7 +1362,8 @@ class ZCodeProviderTest {
         }
         assertEquals(1, captured.size)
         val body = captured.single()
-        assertEquals("disabled", body.getJSONObject("thinking").getString("type"))
+        // OFF resolves to the toggle family's default: enabled.
+        assertEquals("enabled", body.getJSONObject("thinking").getString("type"))
         assertFalse(body.has("output_config"))
     }
 }

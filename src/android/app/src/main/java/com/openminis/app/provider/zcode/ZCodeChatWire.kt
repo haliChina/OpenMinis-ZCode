@@ -47,62 +47,69 @@ object ZCodeChatWire {
      *
      * - GLM-5.3 / GLM-5.3-Flash (levels: low, high, max):
      *   `thinking: {type: "enabled"}` +
-     *   `output_config: {effort: <level>}`. The family declares NO
-     *   disabled level — the official client always thinks — so an
-     *   OFF request omits both fields instead of inventing a disabled
-     *   literal the family never declares. That keeps OFF byte-for-
-     *   byte what this provider sent before thinking was wired up.
-     * - GLM-5.2 (levels: disabled, high, max): OFF is the family's own
-     *   `thinking: {type: "disabled"}` (omitting the field is not
-     *   "off" on a think-by-default backend); enabled levels send
-     *   `thinking: {type: "enabled"}` + `output_config.effort`.
+     *   `output_config: {effort: <level>}`.
+     * - GLM-5.2 (levels: disabled, high, max): the same enabled
+     *   shape; its lowest enabled tier is "high".
      * - GLM-5-Turbo and any other glm-5 (levels: disabled, enabled):
-     *   `thinking: {type: "enabled" | "disabled"}` only — the family
-     *   takes no effort tier.
+     *   `thinking: {type: "enabled"}` only — the family takes no
+     *   effort tier.
      * - Any other model id: no fields. The contract above is only
      *   verified for the GLM-5 families; guessing a shape for an
      *   unknown id is how working requests start 400ing.
      *
-     * Minis levels snap UP onto the family's declared tiers (the
-     * ThinkingRuleResolver clampEffort convention): MEDIUM has no
-     * GLM counterpart and becomes "high"; XHIGH/ULTRA collapse onto
-     * "max" (the same collapse AnthropicProvider.thinkingEffort
+     * OFF means the family default here, NOT "no thinking". The
+     * official client fills a missing reasoningLevel with the family's
+     * LAST declared option and always sends a thinking object (the
+     * GLM-5.3 family does not even declare a disabled level), and
+     * Minis gives this provider no way to tell "the user never chose
+     * a level" from "the user chose OFF": the session row keeps the
+     * two apart (`thinking_override` NULL vs "OFF"), but ChatViewModel
+     * hydrates it into a non-null ThinkingLevel (`persisted ?: OFF`)
+     * and the LLMProvider entry points take a non-null level
+     * defaulting to OFF, so both arrive here as OFF. Reading OFF as
+     * the official default — "max" on GLM-5.3/GLM-5.2, "enabled" on
+     * GLM-5-Turbo — is the behaviour the user chose.
+     *
+     * Accepted consequence, stated plainly: an explicit OFF picked in
+     * Minis is indistinguishable at this seam and ALSO yields the
+     * family default, so the `thinking: {type: "disabled"}` literal
+     * the GLM-5.2 / GLM-5-Turbo rules declare is unreachable through
+     * this provider. Nothing is lost on GLM-5.3, whose rules declare
+     * no disabled level in the first place.
+     *
+     * Explicit Minis levels snap UP onto the family's declared tiers
+     * (the ThinkingRuleResolver clampEffort convention): MEDIUM has
+     * no GLM counterpart and becomes "high"; XHIGH/ULTRA collapse
+     * onto "max" (the same collapse AnthropicProvider.thinkingEffort
      * applies); on GLM-5.2, whose lowest enabled tier is "high",
      * LOW and MEDIUM both become "high".
      */
     fun buildThinkingFields(modelId: String, level: ThinkingLevel): JSONObject {
         val id = modelId.lowercase()
         val fields = JSONObject()
+        // OFF carries the official default (see the KDoc above): the
+        // family's last declared option — MAX for the effort-tiered
+        // families, plain "enabled" for the toggle family.
+        val effective = if (level == ThinkingLevel.OFF) ThinkingLevel.MAX else level
         when {
             // glm-5.3 also matches glm-5.3-flash; the official rules
             // give both the same values and the same map.
             id.contains("glm-5.3") -> {
-                if (level == ThinkingLevel.OFF) return fields
                 fields.put("thinking", JSONObject().put("type", "enabled"))
                 fields.put(
                     "output_config",
-                    JSONObject().put("effort", effortTier(level, low = "low")),
+                    JSONObject().put("effort", effortTier(effective, low = "low")),
                 )
             }
             id.contains("glm-5.2") -> {
-                if (level == ThinkingLevel.OFF) {
-                    fields.put("thinking", JSONObject().put("type", "disabled"))
-                } else {
-                    fields.put("thinking", JSONObject().put("type", "enabled"))
-                    fields.put(
-                        "output_config",
-                        JSONObject().put("effort", effortTier(level, low = "high")),
-                    )
-                }
+                fields.put("thinking", JSONObject().put("type", "enabled"))
+                fields.put(
+                    "output_config",
+                    JSONObject().put("effort", effortTier(effective, low = "high")),
+                )
             }
             id.contains("glm-5") -> {
-                fields.put(
-                    "thinking",
-                    JSONObject().put(
-                        "type",
-                        if (level == ThinkingLevel.OFF) "disabled" else "enabled",
-                    ),
-                )
+                fields.put("thinking", JSONObject().put("type", "enabled"))
             }
         }
         return fields
@@ -112,12 +119,13 @@ object ZCodeChatWire {
      * Snap an enabled Minis level onto a GLM effort ladder whose
      * tiers are [low] / "high" / "max" ([low] is the family's lowest
      * enabled tier: "low" on GLM-5.3, "high" on GLM-5.2). OFF never
-     * reaches here — callers handle it per family.
+     * reaches here — [buildThinkingFields] substitutes the family
+     * default (MAX) for it first.
      */
     private fun effortTier(level: ThinkingLevel, low: String): String = when (level) {
         ThinkingLevel.LOW -> low
         ThinkingLevel.MEDIUM, ThinkingLevel.HIGH -> "high"
         ThinkingLevel.XHIGH, ThinkingLevel.MAX, ThinkingLevel.ULTRA -> "max"
-        ThinkingLevel.OFF -> low // unreached: callers handle OFF first
+        ThinkingLevel.OFF -> low // unreached: OFF is substituted in buildThinkingFields
     }
 }
