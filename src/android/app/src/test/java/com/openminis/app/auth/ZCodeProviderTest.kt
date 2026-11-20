@@ -107,6 +107,115 @@ class ZCodeProviderTest {
         assertEquals(null, ZCodeOAuthManager.jwtExpiryMs("a.b"))
     }
 
+    // ── JWT without exp (the real ZCode shape) ───────────────────────
+    // A live ZCode JWT's payload is {iat, sub, token_version, user_id}
+    // — there is NO exp claim. The login path used to fabricate a
+    // now+1h expire_at for such tokens, so every in-app login was
+    // judged expired ~59 minutes later, locally, with the request
+    // never leaving the phone. The import path (expire_at = 0) never
+    // had the problem — the user's report was exactly that split:
+    // imported tokens never expire, logged-in ones always do.
+
+    /** Same payload shape as the server-issued JWT: no exp claim. */
+    private fun makeJwtNoExp(userId: String): String {
+        fun b64(s: String) =
+            Base64.getUrlEncoder().withoutPadding().encodeToString(s.toByteArray(Charsets.UTF_8))
+        val header = b64("""{"alg":"HS256","typ":"JWT"}""")
+        val payload = b64(
+            """{"iat":1700000000,"sub":"$userId","token_version":1,"user_id":"$userId"}""",
+        )
+        return "$header.$payload.signature"
+    }
+
+    @Test
+    fun `jwt without exp yields a user id but no expiry`() {
+        val jwt = makeJwtNoExp("user-456")
+        assertEquals("user-456", ZCodeOAuthManager.jwtUserId(jwt))
+        assertEquals(null, ZCodeOAuthManager.jwtExpiryMs(jwt))
+    }
+
+    @Test
+    fun `ready stores no local expiry for a jwt without exp`() {
+        val jwt = makeJwtNoExp("jwt-user")
+        val data = JSONObject(
+            """{"token":"$jwt","status":"ready","user":{"user_id":"body-user"},
+                "zai":{"access_token":"zai-access"}}""",
+        )
+        val result = ZCodeOAuthManager.parseReady(data, ZCodeOAuthManager.LoginProvider.ZAI)
+        assertEquals(jwt, result?.jwt)
+        // 0 = no local expiry (the import path's value), NOT a
+        // fabricated login+1h deadline.
+        assertEquals(0L, result?.expiresAtMs)
+    }
+
+    @Test
+    fun `jwt without exp is still valid two hours after login`() {
+        val login = 1_700_000_000_000L
+        val jwt = makeJwtNoExp("user-456")
+        // Even if the blob carries the old fabricated login+1h
+        // deadline, two hours later the token itself still rules:
+        // not locally expired.
+        assertFalse(
+            ZCodeOAuthManager.isLocallyExpired(
+                jwt,
+                storedExpireAtMs = login + 3_600_000,
+                nowMs = login + 2 * 3_600_000,
+            ),
+        )
+    }
+
+    @Test
+    fun `legacy blob whose fabricated deadline already passed heals at read time`() {
+        val now = 1_700_000_000_000L
+        val jwt = makeJwtNoExp("user-456")
+        // A blob written by the old login path an hour ago: its
+        // expire_at is already in the past, but the JWT has no exp,
+        // so the read must return the token, not a forced re-login.
+        assertFalse(
+            ZCodeOAuthManager.isLocallyExpired(
+                jwt,
+                storedExpireAtMs = now - 1_000,
+                nowMs = now,
+            ),
+        )
+    }
+
+    @Test
+    fun `jwt with exp is judged by the claim, not the stored value`() {
+        val now = 1_700_000_000_000L
+        // Claim in the past, stored value says "no expiry": expired.
+        assertTrue(
+            ZCodeOAuthManager.isLocallyExpired(
+                makeJwt("user-1", 1_699_999_000L),
+                storedExpireAtMs = 0,
+                nowMs = now,
+            ),
+        )
+        // Claim in the future, stored value already passed: the claim
+        // wins in this direction too — the token is the source of truth.
+        assertFalse(
+            ZCodeOAuthManager.isLocallyExpired(
+                makeJwt("user-1", 2_000_000_000L),
+                storedExpireAtMs = now - 1_000,
+                nowMs = now,
+            ),
+        )
+    }
+
+    @Test
+    fun `unparseable token falls back to the stored expire_at`() {
+        val now = 1_700_000_000_000L
+        assertTrue(
+            ZCodeOAuthManager.isLocallyExpired("not-a-jwt", now - 1_000, now),
+        )
+        assertFalse(
+            ZCodeOAuthManager.isLocallyExpired("not-a-jwt", 0, now),
+        )
+        assertFalse(
+            ZCodeOAuthManager.isLocallyExpired("not-a-jwt", now + 3_600_000, now),
+        )
+    }
+
     // ── Captcha classification ───────────────────────────────────────────
 
     @Test
