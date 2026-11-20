@@ -2,10 +2,12 @@ package com.openminis.app.auth
 
 import com.openminis.app.data.model.LLMError
 import com.openminis.app.data.model.LLMMessage
+import com.openminis.app.data.model.LLMModel
 import com.openminis.app.data.model.ThinkingLevel
 import com.openminis.app.provider.zcode.ZCodeChatWire
 import com.openminis.app.provider.zcode.ZCodeProvider
 import com.openminis.app.provider.zcode.ZCodeSystemPrompt
+import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
@@ -1166,5 +1168,187 @@ class ZCodeProviderTest {
         assertTrue(thrown is LLMError)
         assertEquals(listOf("chat"), seen)
         assertEquals(null, ZCodeCaptchaGate.pending.value)
+    }
+
+    // ── Thinking fields (official per-model contract) ──────────────────
+    // Shapes from zcode-builtin.json modelApiRules (anthropic-messages):
+    // GLM-5.3 family always thinks with an effort tier, GLM-5.2 adds an
+    // explicit disabled state, GLM-5-Turbo is a bare toggle.
+
+    @Test
+    fun `glm-5_3 sends enabled thinking with the snapped effort`() {
+        fun effort(level: ThinkingLevel) = ZCodeChatWire
+            .buildThinkingFields("GLM-5.3-Flash", level)
+            .getJSONObject("output_config").getString("effort")
+        val on = ZCodeChatWire.buildThinkingFields("GLM-5.3-Flash", ThinkingLevel.HIGH)
+        assertEquals("enabled", on.getJSONObject("thinking").getString("type"))
+        assertEquals("high", effort(ThinkingLevel.HIGH))
+        assertEquals("low", effort(ThinkingLevel.LOW))
+        // MEDIUM is not a GLM tier: it walks up to the next declared one.
+        assertEquals("high", effort(ThinkingLevel.MEDIUM))
+        assertEquals("max", effort(ThinkingLevel.XHIGH))
+        assertEquals("max", effort(ThinkingLevel.MAX))
+        assertEquals("max", effort(ThinkingLevel.ULTRA))
+        // The non-Flash GLM-5.3 shares the family rule.
+        assertEquals(
+            "max",
+            ZCodeChatWire.buildThinkingFields("GLM-5.3", ThinkingLevel.MAX)
+                .getJSONObject("output_config").getString("effort"),
+        )
+    }
+
+    @Test
+    fun `glm-5_3 off sends no thinking fields at all`() {
+        // The family declares no disabled level; OFF keeps the exact
+        // pre-thinking wire shape rather than inventing a literal.
+        val off = ZCodeChatWire.buildThinkingFields("GLM-5.3-Flash", ThinkingLevel.OFF)
+        assertFalse(off.has("thinking"))
+        assertFalse(off.has("output_config"))
+    }
+
+    @Test
+    fun `glm-5_2 off is the explicit disabled literal`() {
+        val off = ZCodeChatWire.buildThinkingFields("GLM-5.2", ThinkingLevel.OFF)
+        assertEquals("disabled", off.getJSONObject("thinking").getString("type"))
+        assertFalse(off.has("output_config"))
+        val high = ZCodeChatWire.buildThinkingFields("GLM-5.2", ThinkingLevel.HIGH)
+        assertEquals("enabled", high.getJSONObject("thinking").getString("type"))
+        assertEquals("high", high.getJSONObject("output_config").getString("effort"))
+        // GLM-5.2's lowest enabled tier is high: LOW walks up to it.
+        assertEquals(
+            "high",
+            ZCodeChatWire.buildThinkingFields("GLM-5.2", ThinkingLevel.LOW)
+                .getJSONObject("output_config").getString("effort"),
+        )
+        assertEquals(
+            "max",
+            ZCodeChatWire.buildThinkingFields("GLM-5.2", ThinkingLevel.MAX)
+                .getJSONObject("output_config").getString("effort"),
+        )
+    }
+
+    @Test
+    fun `glm-5-turbo sends the toggle alone`() {
+        val on = ZCodeChatWire.buildThinkingFields("GLM-5-Turbo", ThinkingLevel.HIGH)
+        assertEquals("enabled", on.getJSONObject("thinking").getString("type"))
+        assertFalse(on.has("output_config"))
+        val off = ZCodeChatWire.buildThinkingFields("GLM-5-Turbo", ThinkingLevel.OFF)
+        assertEquals("disabled", off.getJSONObject("thinking").getString("type"))
+        assertFalse(off.has("output_config"))
+    }
+
+    @Test
+    fun `unknown models get no thinking fields`() {
+        val fields = ZCodeChatWire.buildThinkingFields("some-other-model", ThinkingLevel.HIGH)
+        assertFalse(fields.has("thinking"))
+        assertFalse(fields.has("output_config"))
+    }
+
+    /** Interceptor client that records each chat request body and
+     *  answers [responseBody] with a 200. */
+    private fun capturingClient(
+        captured: MutableList<JSONObject>,
+        responseBody: String,
+    ): OkHttpClient = OkHttpClient.Builder()
+        .addInterceptor(Interceptor { chain ->
+            val req = chain.request()
+            val buf = okio.Buffer()
+            req.body!!.writeTo(buf)
+            captured.add(JSONObject(buf.readUtf8()))
+            cannedResponse(req, 200, responseBody)
+        })
+        .build()
+
+    @Test
+    fun `chat request carries thinking fields for the resolved level`() {
+        val captured = mutableListOf<JSONObject>()
+        val provider = ZCodeProvider(
+            jwtProvider = { makeJwt("user-1", 3600) },
+            model = LLMModel.zcodeFlash,
+            instanceId = "test-thinking-send",
+            httpClient = capturingClient(
+                captured,
+                """{"id":"msg_1","type":"message","role":"assistant",""" +
+                    """"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn",""" +
+                    """"usage":{"input_tokens":3,"output_tokens":1}}""",
+            ),
+        )
+        runBlocking {
+            provider.sendMessageClamped(
+                messages = listOf(LLMMessage(LLMMessage.Role.USER, "hi")),
+                systemPrompt = null,
+                maxTokens = 100,
+                temperature = null,
+                imageParts = emptyList(),
+                tools = emptyList(),
+                thinkingLevel = ThinkingLevel.HIGH,
+            )
+        }
+        assertEquals(1, captured.size)
+        val body = captured.single()
+        assertEquals("enabled", body.getJSONObject("thinking").getString("type"))
+        assertEquals("high", body.getJSONObject("output_config").getString("effort"))
+    }
+
+    @Test
+    fun `chat request at OFF carries no thinking fields on glm-5_3`() {
+        val captured = mutableListOf<JSONObject>()
+        val provider = ZCodeProvider(
+            jwtProvider = { makeJwt("user-1", 3600) },
+            model = LLMModel.zcodeFlash,
+            instanceId = "test-thinking-off",
+            httpClient = capturingClient(
+                captured,
+                """{"id":"msg_1","type":"message","role":"assistant",""" +
+                    """"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn",""" +
+                    """"usage":{"input_tokens":3,"output_tokens":1}}""",
+            ),
+        )
+        runBlocking {
+            provider.sendMessageClamped(
+                messages = listOf(LLMMessage(LLMMessage.Role.USER, "hi")),
+                systemPrompt = null,
+                maxTokens = 100,
+                temperature = null,
+                imageParts = emptyList(),
+                tools = emptyList(),
+                thinkingLevel = ThinkingLevel.OFF,
+            )
+        }
+        assertEquals(1, captured.size)
+        assertFalse(captured.single().has("thinking"))
+        assertFalse(captured.single().has("output_config"))
+    }
+
+    @Test
+    fun `streaming request carries the disabled literal at OFF on glm-5-turbo`() {
+        val captured = mutableListOf<JSONObject>()
+        val sse = buildString {
+            append("data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n")
+            append("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n")
+            append("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n")
+            append("data: [DONE]\n\n")
+        }
+        val provider = ZCodeProvider(
+            jwtProvider = { makeJwt("user-1", 3600) },
+            model = LLMModel.zcodeTurbo,
+            instanceId = "test-thinking-stream",
+            httpClient = capturingClient(captured, sse),
+        )
+        runBlocking {
+            provider.streamMessageClamped(
+                messages = listOf(LLMMessage(LLMMessage.Role.USER, "hi")),
+                systemPrompt = null,
+                maxTokens = 100,
+                temperature = null,
+                imageParts = emptyList(),
+                tools = emptyList(),
+                thinkingLevel = ThinkingLevel.OFF,
+            ).toList()
+        }
+        assertEquals(1, captured.size)
+        val body = captured.single()
+        assertEquals("disabled", body.getJSONObject("thinking").getString("type"))
+        assertFalse(body.has("output_config"))
     }
 }

@@ -65,10 +65,15 @@ import java.util.concurrent.TimeUnit
  *   is the SAME value billing sends.
  * - The request body carries metadata.user_id from the JWT payload
  *   (user_id/sub); when the JWT has none, no metadata is sent.
- * - No thinking fields are sent: the GLM thinking contract on this
- *   channel is unverified, and guessing `thinking`/`output_config` shapes
- *   is how working requests start 400ing. [thinkingLevel] is accepted and
- *   ignored.
+ * - Thinking follows the official client's own per-model contract
+ *   (zcode-builtin.json modelApiRules for anthropic-messages):
+ *   GLM-5.3/5.3-Flash send `thinking:{type:"enabled"}` +
+ *   `output_config:{effort}` (that family declares no disabled
+ *   level, so OFF omits both fields), GLM-5.2 adds an explicit
+ *   `thinking:{type:"disabled"}` OFF state, GLM-5-Turbo sends the
+ *   thinking toggle alone. The level is Minis' resolved
+ *   [thinkingLevel], clamped by the LLMProvider entry points like
+ *   every other provider — see [ZCodeChatWire.buildThinkingFields].
  * - Captcha: on a 3007 challenge the provider asks [ZCodeCaptchaGate]
  *   once; if a manual-verification dialog is mounted the user completes
  *   it in a real WebView and the ORIGINAL request is retried once with
@@ -141,7 +146,7 @@ class ZCodeProvider(
             requireVisionIfImages(messages, imageParts)
             val jwt = jwtProvider()
                 ?: throw LLMError.InvalidApiKey("未登录 ZCode，登录已过期请重新登录。")
-            val body = buildRequestBody(messages, systemPrompt, maxTokens, stream = false, temperature, imageParts, tools, ZCodeOAuthManager.jwtUserId(jwt))
+            val body = buildRequestBody(messages, systemPrompt, maxTokens, stream = false, temperature, imageParts, tools, ZCodeOAuthManager.jwtUserId(jwt), thinkingLevel)
             val response = executeWithCaptchaRetry(jwt, body.toString())
             val responseBody = response.body?.string().orEmpty()
             response.close()
@@ -161,7 +166,7 @@ class ZCodeProvider(
         tools: List<AgentToolDefinition>,
         thinkingLevel: ThinkingLevel,
     ): Flow<LLMStreamChunk> = rawStreamMessage(
-        messages, systemPrompt, maxTokens, temperature, imageParts, tools,
+        messages, systemPrompt, maxTokens, temperature, imageParts, tools, thinkingLevel,
     ).failOnSilentEmptyCompletion(name)
 
     private fun rawStreamMessage(
@@ -171,6 +176,7 @@ class ZCodeProvider(
         temperature: Double?,
         imageParts: List<LLMMessage.ImagePart>,
         tools: List<AgentToolDefinition>,
+        thinkingLevel: ThinkingLevel,
     ): Flow<LLMStreamChunk> = callbackFlow {
         val semaphore = semaphoreFor(instanceId)
         semaphore.acquire()
@@ -178,7 +184,7 @@ class ZCodeProvider(
             requireVisionIfImages(messages, imageParts)
             val jwt = jwtProvider()
                 ?: throw LLMError.InvalidApiKey("未登录 ZCode，登录已过期请重新登录。")
-            val body = buildRequestBody(messages, systemPrompt, maxTokens, stream = true, temperature, imageParts, tools, ZCodeOAuthManager.jwtUserId(jwt))
+            val body = buildRequestBody(messages, systemPrompt, maxTokens, stream = true, temperature, imageParts, tools, ZCodeOAuthManager.jwtUserId(jwt), thinkingLevel)
             val response = executeWithCaptchaRetry(jwt, body.toString())
             if (!response.isSuccessful) {
                 val errorBody = response.body?.string().orEmpty()
@@ -386,6 +392,7 @@ class ZCodeProvider(
         imageParts: List<LLMMessage.ImagePart>,
         tools: List<AgentToolDefinition>,
         userId: String? = null,
+        thinkingLevel: ThinkingLevel = ThinkingLevel.OFF,
     ): JSONObject {
         val body = JSONObject()
         // #22: upstream receives the model id lowercase
@@ -395,6 +402,11 @@ class ZCodeProvider(
         body.put("max_tokens", maxTokens.coerceIn(1, ceiling))
         body.put("stream", stream)
         if (temperature != null) body.put("temperature", temperature)
+        // Thinking: the official client's per-model shape for the
+        // resolved level (empty for OFF on GLM-5.3, whose family
+        // declares no disabled level).
+        val thinkingFields = ZCodeChatWire.buildThinkingFields(model.id, thinkingLevel)
+        for (key in thinkingFields.keys()) body.put(key, thinkingFields.get(key))
         ZCodeChatWire.buildMetadataObject(userId)?.let { body.put("metadata", it) }
         body.put("system", ZCodeSystemPrompt.build(systemPrompt, model.id, workingDirectory))
         if (tools.isNotEmpty()) {
