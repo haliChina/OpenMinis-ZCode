@@ -75,6 +75,36 @@ class ZCodeBillingCaptchaTest {
         override val httpClient: OkHttpClient get() = cannedClient
     }
 
+    /** Same payload shape as the server-issued JWT: no exp claim. */
+    private fun makeJwtNoExp(userId: String): String {
+        fun b64(s: String) =
+            java.util.Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(s.toByteArray(Charsets.UTF_8))
+        val header = b64("""{"alg":"HS256","typ":"JWT"}""")
+        val payload = b64(
+            """{"iat":1700000000,"sub":"$userId","token_version":1,"user_id":"$userId"}""",
+        )
+        return "$header.$payload.signature"
+    }
+
+    @Test
+    fun `legacy blob with a passed fabricated deadline still returns its no-exp jwt`() {
+        // Regression (user report 2026-11-21): in-app logins "expired"
+        // ~59 minutes later while imported tokens never did. The old
+        // login path fabricated expire_at = login+1h for JWTs that
+        // carry no exp; validAccessToken judged by that stored value
+        // locally and the request never left the phone. A blob written
+        // by that build must heal at read time: the token itself has
+        // no exp, so it is not locally expired.
+        val jwt = makeJwtNoExp("user-789")
+        val blob = """{"access_token":"$jwt","expire_at":${System.currentTimeMillis() - 60_000},""" +
+            """"login_provider":"zai","user_id":"user-789"}"""
+        prefs.edit().putString("oauth_tokens_test-session-expiry", blob).commit()
+        val manager = ZCodeOAuthManager(ctx, "test-session-expiry")
+        assertEquals(jwt, runBlocking { manager.validAccessToken() })
+        assertTrue(manager.isAuthenticated())
+    }
+
     @Test
     fun `billing claim still opens the captcha dialog when skipModelRequest is true`() {
         val seen = mutableListOf<String>()
