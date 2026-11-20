@@ -3359,6 +3359,46 @@ private fun formatMdMediaMs(ms: Int): String {
     return "%d:%02d".format(totalSec / 60, totalSec % 60)
 }
 
+/**
+ * [T-md-video-thumb] One frame for the video thumbnail card.
+ *
+ * getFrameAtTime returns the frame at SOURCE resolution — a 4K video yields
+ * a ~33MB bitmap for a card that displays at most ~280dp tall, and several
+ * video blocks in one transcript stack those allocations up (the failure is
+ * a native allocation abort, which no catch can soften). Ask the retriever
+ * for a thumbnail-sized frame instead (API 27+); on API 26 scale the full
+ * frame down and recycle it. A video already at thumbnail size takes the
+ * plain call, exactly as before.
+ */
+private fun mdVideoThumbnailFrame(retriever: MediaMetadataRetriever): Bitmap? {
+    val target = 480
+    if (android.os.Build.VERSION.SDK_INT >= 27) {
+        val w = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
+        val h = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
+        if (w > target || h > target) {
+            val scale = target.toFloat() / maxOf(w, h)
+            return retriever.getScaledFrameAtTime(
+                0,
+                MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                (w * scale).toInt().coerceAtLeast(1),
+                (h * scale).toInt().coerceAtLeast(1),
+            )
+        }
+        return retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+    }
+    val full = retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC) ?: return null
+    if (full.width <= target && full.height <= target) return full
+    val scale = target.toFloat() / maxOf(full.width, full.height)
+    val small = Bitmap.createScaledBitmap(
+        full,
+        (full.width * scale).toInt().coerceAtLeast(1),
+        (full.height * scale).toInt().coerceAtLeast(1),
+        true,
+    )
+    if (small !== full) full.recycle()
+    return small
+}
+
 @Composable
 private fun RenderMdVideo(block: MdBlock.Video) {
     val context = LocalContext.current
@@ -3374,7 +3414,7 @@ private fun RenderMdVideo(block: MdBlock.Video) {
             val retriever = MediaMetadataRetriever()
             try {
                 retriever.setDataSource(f.absolutePath)
-                val bmp = retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                val bmp = mdVideoThumbnailFrame(retriever)
                 android.util.Log.d("MdStream", "video thumbnail ${f.name} -> ${bmp?.width}x${bmp?.height}")
                 bmp
             } catch (t: Throwable) {
