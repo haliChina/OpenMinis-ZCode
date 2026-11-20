@@ -109,6 +109,42 @@ jobs:
         working-directory: src/android
         run: ./gradlew :app:assembleGithubDebug --no-daemon --console=plain
 
+      - name: Sign APK with the stable keystore
+        # Gradle signs with the per-runner debug keystore, whose signature
+        # changes on every CI run and blocks in-place updates on the device.
+        # Re-sign with the project's stable keystore (kept in repo secrets)
+        # so every delivered APK carries the same signature.
+        env:
+          APK_KEYSTORE_PASSWORD: ${{ secrets.APK_KEYSTORE_PASSWORD }}
+          APK_KEY_PASSWORD: ${{ secrets.APK_KEY_PASSWORD }}
+        run: |
+          if [ -z "${{ secrets.APK_KEYSTORE_BASE64 }}" ]; then
+            echo "::error::APK_KEYSTORE_BASE64 secret is not set"
+            exit 1
+          fi
+          KS="$RUNNER_TEMP/stable-signing.jks"
+          trap 'rm -f "$KS"' EXIT
+          echo "${{ secrets.APK_KEYSTORE_BASE64 }}" | base64 -d > "$KS"
+          APKSIGNER=$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n 1)
+          echo "Using $APKSIGNER"
+          for APK in \
+            src/android/app/build/outputs/apk/github/debug/app-github-debug.apk \
+            src/android/app/build/outputs/apk/debug/app-debug.apk; do
+            if [ -f "$APK" ]; then
+              SIGNED="$RUNNER_TEMP/$(basename "$APK" .apk)-signed.apk"
+              "$APKSIGNER" sign \
+                --ks "$KS" \
+                --ks-pass env:APK_KEYSTORE_PASSWORD \
+                --key-pass env:APK_KEY_PASSWORD \
+                --ks-key-alias "${{ secrets.APK_KEY_ALIAS }}" \
+                --out "$SIGNED" \
+                "$APK"
+              rm -f "$SIGNED.idsig"
+              mv "$SIGNED" "$APK"
+              "$APKSIGNER" verify --print-certs "$APK" | head -n 3
+            fi
+          done
+
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
