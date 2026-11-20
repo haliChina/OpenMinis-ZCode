@@ -1072,9 +1072,16 @@ fun ChatScreen(
         if (uris.isEmpty()) return@rememberLauncherForActivityResult
         val limited = uris.take(ATTACHMENT_PICK_LIMIT)
         for (uri in limited) {
-            val mimeType = context.contentResolver.getType(uri) ?: "image/jpeg"
-            val isVideo = mimeType.startsWith("video/")
-            val defaultName = if (isVideo) "video.mp4" else "image.jpg"
+            // [T-attachment-ingest-io] Only a positively-identified image
+            // takes the image path. getType() returns null when the provider
+            // cannot classify the item, and the old "image/jpeg" fallback
+            // sent every unknown item — including videos — down the image
+            // ingest path, whose whole-file read is the wrong place for a
+            // multi-GB video. Unknown types now take the streamed document
+            // path, like videos.
+            val mimeType = context.contentResolver.getType(uri) ?: "application/octet-stream"
+            val isImage = mimeType.startsWith("image/")
+            val defaultName = if (isImage) "image.jpg" else "video.mp4"
             val fileName = getFileName(context, uri) ?: defaultName
             viewModel.addAttachment(
                 InputAttachment(
@@ -1084,7 +1091,7 @@ fun ChatScreen(
                     // Videos are routed as DOCUMENT for now — vision pipeline only
                     // handles images today; videos still upload as raw files so
                     // tools that read them (e.g. ffmpeg) get the bytes.
-                    kind = if (isVideo) InputAttachment.Kind.DOCUMENT else InputAttachment.Kind.IMAGE,
+                    kind = if (isImage) InputAttachment.Kind.IMAGE else InputAttachment.Kind.DOCUMENT,
                 ),
             )
         }
@@ -2660,6 +2667,24 @@ fun ChatScreen(
             if (ev.droppedCount > 0) {
                 snackbarHostState.showSnackbar(
                     context.getString(R.string.image_budget_total_exceeded),
+                )
+            }
+        }
+    }
+
+    // [T-attachment-ingest-io] Surface ingest size-cap skips via Snackbar:
+    // a single file over the ingest caps in ChatAttachmentIngest never went
+    // out at all — same "the user needs to know" reasoning as the
+    // image-budget drops above.
+    LaunchedEffect(Unit) {
+        viewModel.attachmentSkippedEvent.collect { names ->
+            if (names.size == 1) {
+                snackbarHostState.showSnackbar(
+                    context.getString(R.string.attachment_too_large_skipped, names.first()),
+                )
+            } else if (names.size > 1) {
+                snackbarHostState.showSnackbar(
+                    context.getString(R.string.attachments_too_large_skipped, names.size),
                 )
             }
         }

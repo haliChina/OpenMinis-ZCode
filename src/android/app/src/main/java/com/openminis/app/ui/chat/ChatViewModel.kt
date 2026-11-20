@@ -1496,6 +1496,17 @@ class ChatViewModel(
     val imageBudgetEvent: SharedFlow<ImageBudget.BudgetResult> = _imageBudgetEvent.asSharedFlow()
 
     /**
+     * One-shot events for attachments that ingest refused outright because a
+     * single file exceeded the size caps in [ChatAttachmentIngest] — as
+     * opposed to the cumulative message budget above, where the message
+     * still goes out with fewer images. ChatScreen collects this flow and
+     * surfaces a Snackbar naming the skipped file(s): a file the user
+     * attached did not go out, which they need to know.
+     */
+    private val _attachmentSkippedEvent = MutableSharedFlow<List<String>>(extraBufferCapacity = 4)
+    val attachmentSkippedEvent: SharedFlow<List<String>> = _attachmentSkippedEvent.asSharedFlow()
+
+    /**
      * Request-level image-budget events (T-request-imgsize). Emitted by
      * [applyRequestImageBudget] when the cumulative history image payload
      * exceeds [ImageBudget.MAX_REQUEST_BYTES] and older images had to be
@@ -16628,26 +16639,68 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
      * NOT inlined into the LLM payload (parity with iOS processAttachments,
      * AIChatViewModel.swift L1552-1645).
      */
-    private fun prepareUserAttachments(
+    private suspend fun prepareUserAttachments(
         attachments: List<InputAttachment>,
         sessionId: String,
     ): PreparedAttachments =
-        ChatAttachmentIngest.prepare(
-            attachments = attachments,
-            sessionId = sessionId,
-            filesDir = context.filesDir,
-            mediaStore = mediaStore,
-            openStream = { context.contentResolver.openInputStream(it.uri) },
-            clockMs = System::currentTimeMillis,
-            onBudgetMutated = { budgetResult ->
-                AppLogger.info(
-                    TAG,
-                    "[ImageBudget] compose: in=${budgetResult.keptBytes.size + budgetResult.droppedCount} kept=${budgetResult.keptBytes.size} compressed=${budgetResult.compressedCount} dropped=${budgetResult.droppedCount} totalBytes=${budgetResult.totalBytes}",
-                )
-                _imageBudgetEvent.tryEmit(budgetResult)
-            },
-            fileUri = Uri::fromFile,
-        )
+        // [T-attachment-ingest-io] Ingest is pure I/O + decode work (stream
+        // copies, MediaStore writes, image downscale). It used to run inline
+        // on the caller's dispatcher — sendMessage & friends live on the main
+        // dispatcher, so copying a 1.7GB video froze the UI for ~11s until
+        // the platform watchdog restarted the process as crash_or_stall
+        // (device log 2026-11-21: MIUIScout APP_SCOUT_HANG, main-thread stack
+        // inside ChatAttachmentIngest.prepare's copyTo). All three call
+        // sites are already in suspend functions; switching here moves every
+        // one of them off the main thread in a single place.
+        withContext(Dispatchers.IO) {
+            ChatAttachmentIngest.prepare(
+                attachments = attachments,
+                sessionId = sessionId,
+                filesDir = context.filesDir,
+                mediaStore = mediaStore,
+                openStream = { context.contentResolver.openInputStream(it.uri) },
+                clockMs = System::currentTimeMillis,
+                onBudgetMutated = { budgetResult ->
+                    AppLogger.info(
+                        TAG,
+                        "[ImageBudget] compose: in=${budgetResult.keptBytes.size + budgetResult.droppedCount} kept=${budgetResult.keptBytes.size} compressed=${budgetResult.compressedCount} dropped=${budgetResult.droppedCount} totalBytes=${budgetResult.totalBytes}",
+                    )
+                    _imageBudgetEvent.tryEmit(budgetResult)
+                },
+                fileUri = Uri::fromFile,
+                sizeOf = { queryAttachmentSize(it.uri) },
+                onAttachmentsSkipped = { names ->
+                    AppLogger.info(TAG, "[AttachmentIngest] skipped oversize attachment(s): $names")
+                    _attachmentSkippedEvent.tryEmit(names)
+                },
+            )
+        }
+
+    /**
+     * Declared size of an attachment's source in bytes, or null when the
+     * provider does not report one. Ingest uses it to reject oversize files
+     * BEFORE any bytes move; a null size falls back to the bounded reads in
+     * [ChatAttachmentIngest.prepare], which enforce the same caps while
+     * streaming.
+     */
+    private fun queryAttachmentSize(uri: Uri): Long? {
+        if (uri.scheme == "file") {
+            return uri.path?.let { java.io.File(it) }?.takeIf { it.isFile }?.length()
+        }
+        return try {
+            context.contentResolver.query(
+                uri,
+                arrayOf(android.provider.OpenableColumns.SIZE),
+                null,
+                null,
+                null,
+            )?.use { cursor ->
+                if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getLong(0) else null
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
 
     /**
      * Compute a unique-on-disk filename inside [dir] for [original]. Strips
@@ -18855,6 +18908,14 @@ internal object ChatHistoryRebuild {
                             if (!mime.startsWith("image/")) continue
                             val file = java.io.File(mediaBaseDir, rel)
                             if (!file.exists()) continue
+                            // [T-attachment-ingest-io] Same per-file cap as
+                            // ingest: this whole-reads the stored original,
+                            // and an OutOfMemoryError on a pathological
+                            // original is an Error — the catch below would
+                            // not stop it and the restore would kill the
+                            // process. Skip just the model image part; the
+                            // mediaRef and the file itself stay untouched.
+                            if (file.length() > ChatAttachmentIngest.MAX_IMAGE_FILE_BYTES) continue
                             val original = try { file.readBytes() } catch (_: Exception) { continue }
                             val restoredPath = v.optString("linuxPath", "").ifEmpty { null }
                             // [T-android-image-downscale-parity] The saved file is the
@@ -18959,6 +19020,92 @@ internal data class PreparedAttachments(
  */
 internal object ChatAttachmentIngest {
     private const val TAG = ChatViewModel.TAG
+
+    // [T-attachment-ingest-io] Ingest size caps. The codebase's own threshold
+    // for "readBytes() is dangerous" is ~100MB (see the MediaStore KDoc and
+    // the non-image branch below: a 400MB APK OOMs a ~500MB heap). The image
+    // cap adopts that number per file; the document cap is larger because
+    // documents are stream-copied, never loaded — its cost is copy time and
+    // the two full copies (uploads + MediaStore), so 512MB bounds the worst
+    // case at ~1GB of background I/O.
+    const val MAX_IMAGE_FILE_BYTES: Long = 100L * 1024 * 1024
+    const val MAX_DOCUMENT_FILE_BYTES: Long = 512L * 1024 * 1024
+
+    /**
+     * Running-total cap on model-bound image bytes kept during one
+     * [prepare] pass. The end-of-loop [ImageBudget.applyMessageBudget] runs
+     * on post-downscale bytes, so without this a stack of undecodable files
+     * could each sit just under [MAX_IMAGE_FILE_BYTES] and still add up past
+     * the heap before the budget ever runs. 50MB of raw bytes is ~2x the
+     * 25MB base64 wire budget's raw equivalent, so anything this stops here
+     * is material the budget would have dropped anyway.
+     */
+    const val MAX_HELD_IMAGE_BYTES: Long = 50L * 1024 * 1024
+
+    /** Outcome of the bounded image read in [prepare]. */
+    private sealed interface ImageRead {
+        class Ok(val bytes: ByteArray) : ImageRead
+        object Failed : ImageRead
+        object TooLarge : ImageRead
+    }
+
+    /**
+     * Read one image attachment with a hard cap: the stream is consumed in
+     * chunks and abandoned the moment it passes [MAX_IMAGE_FILE_BYTES], so
+     * an undeclared-size source can never be whole-loaded the way the old
+     * unbounded `readBytes()` loaded it.
+     */
+    private fun readImageBytes(
+        attachment: InputAttachment,
+        openStream: (InputAttachment) -> java.io.InputStream?,
+    ): ImageRead {
+        val input = try {
+            openStream(attachment)
+        } catch (e: Exception) {
+            Log.w(TAG, "image read failed for ${attachment.fileName}: ${e.message}")
+            return ImageRead.Failed
+        } ?: return ImageRead.Failed
+        return try {
+            input.use { stream ->
+                val out = java.io.ByteArrayOutputStream()
+                val buf = ByteArray(64 * 1024)
+                var total = 0L
+                while (true) {
+                    val n = stream.read(buf)
+                    if (n < 0) break
+                    total += n
+                    if (total > MAX_IMAGE_FILE_BYTES) return ImageRead.TooLarge
+                    out.write(buf, 0, n)
+                }
+                ImageRead.Ok(out.toByteArray())
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "image read failed for ${attachment.fileName}: ${e.message}")
+            ImageRead.Failed
+        }
+    }
+
+    /**
+     * Stream-copy with a hard byte cap: returns false as soon as the input
+     * passes [maxBytes], leaving a partial file the caller deletes. Used for
+     * document sources whose size the provider did not declare.
+     */
+    private fun copyBounded(
+        input: java.io.InputStream,
+        output: java.io.OutputStream,
+        maxBytes: Long,
+    ): Boolean {
+        val buf = ByteArray(64 * 1024)
+        var total = 0L
+        while (true) {
+            val n = input.read(buf)
+            if (n < 0) break
+            total += n
+            if (total > maxBytes) return false
+            output.write(buf, 0, n)
+        }
+        return true
+    }
 
     fun uniqueUploadFileName(dir: java.io.File, original: String): String {
         val raw = original.substringAfterLast('/').substringAfterLast('\\').ifBlank { "image.jpg" }
@@ -19102,6 +19249,13 @@ internal object ChatAttachmentIngest {
      * contentResolver.openInputStream(uri)), [filesDir], [clockMs], [fileUri]
      * (Uri.fromFile) — and the budget event + log run in [onBudgetMutated],
      * at the same point.
+     *
+     * [T-attachment-ingest-io] [sizeOf] reports a source's declared size (or
+     * null when undeclared) so oversize files are refused BEFORE any bytes
+     * move; undeclared sources are still bounded by capped reads/copies
+     * while streaming. Refused files are collected and reported once through
+     * [onAttachmentsSkipped] at the end. Both default to inert so existing
+     * callers (tests) keep their previous behaviour apart from the caps.
      */
     fun prepare(
         attachments: List<InputAttachment>,
@@ -19112,6 +19266,8 @@ internal object ChatAttachmentIngest {
         clockMs: () -> Long,
         onBudgetMutated: (ImageBudget.BudgetResult) -> Unit,
         fileUri: (java.io.File) -> Uri,
+        sizeOf: (InputAttachment) -> Long? = { null },
+        onAttachmentsSkipped: (List<String>) -> Unit = {},
     ): PreparedAttachments {
         val imageParts = mutableListOf<LLMMessage.ImagePart>()
         val imageUris = mutableListOf<Uri>()
@@ -19130,6 +19286,12 @@ internal object ChatAttachmentIngest {
         // [T-android-image-downscale-parity] One entry per imageParts entry: the
         // "downscaled from W×H" note, or null when the image was sent as-is.
         val imageModelNotes = mutableListOf<String?>()
+        // [T-attachment-ingest-io] File names refused by the size gates below
+        // (reported once via onAttachmentsSkipped at the end), and the running
+        // total of model-bound image bytes kept so far — the accumulation
+        // guard for the image loop (see MAX_HELD_IMAGE_BYTES).
+        val skippedOversize = mutableListOf<String>()
+        var heldImageBytes = 0L
         // T132: also write the resized bytes into the session's iSH-bound
         // attachments dir (filesDir/minis-sessions/<sid>/attachments/uploads/),
         // which is mounted at /var/minis/attachments/ inside iSH. This makes
@@ -19158,12 +19320,40 @@ internal object ChatAttachmentIngest {
                 // shell tools (read_image / cat) saw a 1024px JPEG instead
                 // of the user's original picture. Matches iOS canonical
                 // (AIChatViewModel.swift L1595-1617).
-                val rawBytes = try {
-                    openStream(attachment)?.use { it.readBytes() }
-                } catch (e: Exception) {
-                    Log.w(TAG, "image read failed for ${attachment.fileName}: ${e.message}")
-                    null
-                } ?: continue
+                //
+                // [T-attachment-ingest-io] The read itself is size-gated.
+                // readBytes() whole-loads the file (peak ~2x its size), the
+                // catches on this path only see Exception, and an
+                // OutOfMemoryError is an Error — a ≳100MB "image" (a video
+                // misrouted here by a picker that could not type it, or a
+                // giant GIF) killed the process at send time. A file whose
+                // declared size is over the cap is refused before it is
+                // opened; an undeclared size is enforced by the bounded
+                // read; and once the kept model bytes pass the hold cap the
+                // remaining images are refused unread, because the budget
+                // below runs on post-downscale bytes and cannot bound what
+                // undecodable files accumulate. Skips are surfaced through
+                // onAttachmentsSkipped.
+                val declaredImageSize = sizeOf(attachment)
+                if (declaredImageSize != null && declaredImageSize > MAX_IMAGE_FILE_BYTES) {
+                    Log.w(TAG, "image attachment too large, skipped: ${attachment.fileName} ($declaredImageSize bytes)")
+                    skippedOversize.add(attachment.fileName)
+                    continue
+                }
+                if (heldImageBytes > MAX_HELD_IMAGE_BYTES) {
+                    Log.w(TAG, "image attachments past the ingest hold cap, skipped: ${attachment.fileName}")
+                    skippedOversize.add(attachment.fileName)
+                    continue
+                }
+                val rawBytes = when (val read = readImageBytes(attachment, openStream)) {
+                    is ImageRead.Ok -> read.bytes
+                    ImageRead.TooLarge -> {
+                        Log.w(TAG, "image attachment too large, skipped: ${attachment.fileName}")
+                        skippedOversize.add(attachment.fileName)
+                        continue
+                    }
+                    ImageRead.Failed -> continue
+                }
                 val ingested = ChatAttachmentIngest.ingestImage(
                     rawBytes, attachment.mimeType, attachment.fileName, sessionId, mediaStore, uploadsHostDir,
                 ) ?: continue
@@ -19174,6 +19364,7 @@ internal object ChatAttachmentIngest {
                 }
                 imageParts.add(ingested.imagePart)
                 imageModelNotes.add(ingested.modelNote)
+                heldImageBytes += ingested.imagePart.data.size.toLong()
                 val savedFile = java.io.File(mediaStore.mediaBaseDir, ingested.ref.relativePath)
                 imageUris.add(fileUri(savedFile))
                 imageNames.add(attachment.fileName)
@@ -19197,19 +19388,54 @@ internal object ChatAttachmentIngest {
             // Stream-copy to the uploads dest first, then hand that
             // file to MediaStore.saveMediaStreamed so a second
             // streaming pass produces the durable mediaRef.
+            // [T-attachment-ingest-io] Streamed does not mean free: this
+            // branch makes TWO full passes over the file (the uploads copy
+            // here + the MediaStore copy below), so a 1.7GB video is ~3.4GB
+            // of I/O and disk churn before the message even exists. A file
+            // whose declared size is over the cap is refused before the
+            // first byte moves; an undeclared size is enforced by the
+            // bounded copy instead.
+            val declaredDocSize = sizeOf(attachment)
+            if (declaredDocSize != null && declaredDocSize > MAX_DOCUMENT_FILE_BYTES) {
+                Log.w(TAG, "document attachment too large, skipped: ${attachment.fileName} ($declaredDocSize bytes)")
+                skippedOversize.add(attachment.fileName)
+                continue
+            }
             nonImageNames.add(attachment.fileName)
             val safeName = uniqueUploadFileName(uploadsHostDir, attachment.fileName)
             val dest = java.io.File(uploadsHostDir, safeName)
+            var copyOversize = false
             val uploadOk = try {
-                openStream(attachment)?.use { input ->
-                    dest.outputStream().use { output -> input.copyTo(output) }
-                } != null
+                val input = openStream(attachment)
+                if (input == null) {
+                    false
+                } else {
+                    input.use { inp ->
+                        dest.outputStream().use { output ->
+                            val ok = copyBounded(inp, output, MAX_DOCUMENT_FILE_BYTES)
+                            if (!ok) copyOversize = true
+                            ok
+                        }
+                    }
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "non-image upload write failed for ${attachment.fileName}: ${e.message}")
                 runCatching { dest.delete() }
                 false
             }
-            if (!uploadOk) continue
+            if (!uploadOk) {
+                if (copyOversize) {
+                    // The bounded copy tripped the cap on an undeclared-size
+                    // stream: drop the partial file and the name added above,
+                    // so the message does not promise a file that is not
+                    // there, and report the skip like a declared one.
+                    runCatching { dest.delete() }
+                    nonImageNames.removeAt(nonImageNames.lastIndex)
+                    Log.w(TAG, "document attachment too large, skipped: ${attachment.fileName}")
+                    skippedOversize.add(attachment.fileName)
+                }
+                continue
+            }
 
             val ref = try {
                 dest.inputStream().use { input ->
@@ -19285,6 +19511,12 @@ internal object ChatAttachmentIngest {
                 append("\" />\n")
             }
             append("</user-attached-files>")
+        }
+
+        // [T-attachment-ingest-io] Report every size-cap refusal from this
+        // pass in one event, whatever branch produced it.
+        if (skippedOversize.isNotEmpty()) {
+            onAttachmentsSkipped(skippedOversize.toList())
         }
 
         // Order matches UserAttachmentList convention: images first, then files.
