@@ -163,3 +163,7 @@ src/android/app/libs/rclone.aar
 deps/aot/*.S
 deps/aot/.build/
 deps/aot/.build-iphonesimulator/
+
+# ZCode LAN proxy config: contains a live JWT and the proxy access key.
+tools/zcode-lan-proxy/zcode-proxy-config.json
+__pycache__/
