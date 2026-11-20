@@ -66,14 +66,19 @@ import java.util.concurrent.TimeUnit
  * - The request body carries metadata.user_id from the JWT payload
  *   (user_id/sub); when the JWT has none, no metadata is sent.
  * - Thinking follows the official client's own per-model contract
- *   (zcode-builtin.json modelApiRules for anthropic-messages):
- *   GLM-5.3/5.3-Flash send `thinking:{type:"enabled"}` +
- *   `output_config:{effort}` (that family declares no disabled
- *   level, so OFF omits both fields), GLM-5.2 adds an explicit
- *   `thinking:{type:"disabled"}` OFF state, GLM-5-Turbo sends the
- *   thinking toggle alone. The level is Minis' resolved
+ *   (zcode-builtin.json modelApiRules for anthropic-messages),
+ *   including its default: GLM-5.3/5.3-Flash send
+ *   `thinking:{type:"enabled"}` + `output_config:{effort}`,
+ *   GLM-5.2 the same shape with "high" as its lowest tier, and
+ *   GLM-5-Turbo the thinking toggle alone. A resolved level of OFF
+ *   lands on the family's default tier ("max" / "enabled"): Minis
+ *   cannot distinguish "never chosen" from "chosen off" at the
+ *   provider boundary, and the official client defaults a missing
+ *   reasoningLevel to the family's last option — so this provider
+ *   has no reachable disabled state. The level is Minis' resolved
  *   [thinkingLevel], clamped by the LLMProvider entry points like
- *   every other provider — see [ZCodeChatWire.buildThinkingFields].
+ *   every other provider — see [ZCodeChatWire.buildThinkingFields]
+ *   for the full contract and the accepted consequence.
  * - Captcha: on a 3007 challenge the provider asks [ZCodeCaptchaGate]
  *   once; if a manual-verification dialog is mounted the user completes
  *   it in a real WebView and the ORIGINAL request is retried once with
