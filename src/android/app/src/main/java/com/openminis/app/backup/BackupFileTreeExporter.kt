@@ -71,7 +71,32 @@ class BackupFileTreeExporter(
 
         val base = root.canonicalFile
         var scanned = 0
-        for (entry in base.walkTopDown()) {
+        // [T-android-backup-symlink-inflation] Directory symlinks are pruned
+        // via onEnter, because walkTopDown follows them: a filter in the loop
+        // body cannot stop the walk stepping into a linked directory, it can
+        // only decline the entries after the whole subtree has already been
+        // traversed (and hashed, and copied). This is the same bug
+        // `SessionStorage.directorySize` was fixed for, and the trees exported
+        // here multiply under it — agent workspaces are full of
+        // `.venv/lib64 -> lib`, `lib -> usr/lib` and node_modules link farms,
+        // each link re-walking its target subtree in full, and a link cycle
+        // makes the walk effectively endless.
+        //
+        // A pruned link directory contributes NO entry at all. Restore
+        // semantics: there is simply no directory at the link path in the
+        // package — the target's content is packaged at its real path when
+        // that path is inside an exported tree, and is not part of this
+        // backup when it is not. Nothing is lost that iOS keeps: its
+        // enumerator does not descend into linked directories either.
+        //
+        // File symlinks are NOT pruned: the walk yields them without
+        // descending, and the loop below stores the target's bytes once,
+        // under their content hash — the iOS behaviour for a linked file.
+        // The root itself is exempt: it is the caller's chosen tree, already
+        // canonicalised above.
+        for (entry in base.walkTopDown().onEnter { dir ->
+            dir == base || !isSymlink(dir)
+        }) {
             if (++scanned % CANCEL_CHECK_EVERY == 0 && isCancelled()) {
                 throw kotlinx.coroutines.CancellationException("Backup stopped")
             }
@@ -87,6 +112,11 @@ class BackupFileTreeExporter(
             if (isBackupArtifact(rel)) continue
 
             if (entry.isDirectory) {
+                // A directory symlink is still yielded even though onEnter
+                // pruned its descent. It is not recorded either: the link is
+                // not content, and a directory entry at the link path would
+                // restore a real directory where a link used to be.
+                if (isSymlink(entry)) continue
                 // Empty directories would otherwise vanish, since nothing
                 // references them.
                 if (entry.listFiles()?.isEmpty() == true) {
@@ -156,6 +186,20 @@ class BackupFileTreeExporter(
         AppLogger.error(TAG, "[Backup] unreadable file $logicalPath: ${e.message}")
         null
     }
+
+    /**
+     * True when [f] is itself a symbolic link, mirroring the helper in
+     * `SessionStorage`: `Files.isSymbolicLink` does not follow the final
+     * component, which is exactly the question being asked; it is one lstat;
+     * and it answers true for a broken link rather than throwing, so an
+     * unreadable path simply answers false and is treated as a normal entry.
+     */
+    private fun isSymlink(f: File): Boolean =
+        try {
+            java.nio.file.Files.isSymbolicLink(f.toPath())
+        } catch (_: Exception) {
+            false
+        }
 
     /**
      * True for anything that is itself a backup artifact — a delivered
