@@ -136,7 +136,7 @@ class BackupExporter(
                 if (BackupCategory.CHATS in options.categories) {
                     onProgress?.invoke("Exporting chats…")
                     stats[BackupCategory.CHATS.key] =
-                        exportChats(dataDir, trees, options.snapshotAtMillis)
+                        exportChats(dataDir, trees, options.snapshotAtMillis, onProgress)
                 }
                 if (BackupCategory.SHARED_FILES in options.categories) {
                     onProgress?.invoke("Exporting shared files…")
@@ -254,6 +254,7 @@ class BackupExporter(
         dataDir: File,
         trees: BackupFileTreeExporter,
         snapshotAtMillis: Long,
+        onProgress: ((String) -> Unit)?,
     ): BackupManifest.CategoryStat {
         val dao = db.chatDao()
         var messageCount = 0
@@ -265,7 +266,29 @@ class BackupExporter(
             BackupJsonlWriter(dataDir, "messages").use { messages ->
                 BackupJsonlWriter(dataDir, "compact_markers").use { markers ->
                     BackupJsonlWriter(dataDir, "folders").use { folders ->
-                        for (session in dao.listSessions()) {
+                        val allSessions = dao.listSessions()
+                        val total = allSessions.size
+                        var visited = 0
+                        var lastProgressAt = 0L
+                        for (session in allSessions) {
+                            // Per-session progress, mirroring iOS's
+                            // BackupProgressReporter: counted at visit time,
+                            // BEFORE the snapshot filter below, so the number
+                            // always advances — a run whose tail is all
+                            // newer-than-snapshot sessions would otherwise
+                            // appear to stall just before finishing. Throttled
+                            // to one line a second (the last session always
+                            // reports), because every line lands in the run
+                            // log and a multi-thousand-session export must not
+                            // flood it with a row per session.
+                            visited += 1
+                            if (onProgress != null && total > 1) {
+                                val now = System.currentTimeMillis()
+                                if (visited == total || now - lastProgressAt >= PROGRESS_INTERVAL_MS) {
+                                    lastProgressAt = now
+                                    onProgress("Exporting chats… ($visited/$total)")
+                                }
+                            }
                             // Snapshot cut-off: a session updated after the user
                             // pressed Create Backup is not part of this backup's
                             // view. Excluding the WHOLE session rather than
@@ -639,12 +662,30 @@ class BackupExporter(
     ): BackupManifest {
         // Integrity covers every packaged file, hashed over whatever bytes
         // actually ship — ciphertext once encryption has run (§5.3).
+        //
+        // Blob members are the exception to re-hashing: BackupBlobStore
+        // files each blob under the SHA-256 of its content and records that
+        // digest in the blob index, so for an UNENCRYPTED package the digest
+        // on record IS the hash of the staged bytes — recomputing it would
+        // re-read every media file in the package for a value already
+        // known. Encrypted packages keep the full re-hash: encryption has
+        // replaced the staged bytes with ciphertext, and §5.3 hashes the
+        // ciphertext, which the index digest does not describe. A staged
+        // blob with no index entry (should not happen — every stored blob
+        // is indexed) falls back to hashing like any other member.
+        val blobDigests: Map<String, String> = if (encryption == null) {
+            blobStore.blobIndex.associate { entry ->
+                "blobs/${entry.sha256.take(2)}/${entry.sha256}" to entry.sha256
+            }
+        } else {
+            emptyMap()
+        }
         val base = staging.canonicalFile
         val integrity = base.walkTopDown()
             .filter { it.isFile && it.name != "manifest.json" } // can't hash itself
             .associate { file ->
-                file.relativeTo(base).path.replace(File.separatorChar, '/') to
-                    BackupBlobStore.sha256OfFile(file)
+                val rel = file.relativeTo(base).path.replace(File.separatorChar, '/')
+                rel to (blobDigests[rel] ?: BackupBlobStore.sha256OfFile(file))
             }
 
         return BackupManifest(
@@ -719,6 +760,9 @@ class BackupExporter(
 
     companion object {
         private const val TAG = "Backup"
+
+        /** Minimum gap between per-session chats progress lines (iOS: 1s). */
+        private const val PROGRESS_INTERVAL_MS = 1_000L
 
         /**
          * Process-wide export/restore lock. Both read the same stores, and a

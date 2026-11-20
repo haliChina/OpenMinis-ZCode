@@ -6,6 +6,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import java.io.File
+import java.nio.file.Files
 
 /**
  * Tree walking, tombstones, and the two rules that exist to prevent silent data
@@ -171,5 +172,91 @@ class BackupFileTreeExporterTest {
         val r = trees.export(File(tmp, "does-not-exist"), "skills", BackupCategory.SKILLS)
         assertEquals(0, r.filesIncluded)
         assertEquals(0, r.filesSkipped)
+    }
+
+    /**
+     * Directory symlinks are pruned, not descended: the target subtree is
+     * packaged at its real path only. This is the multiplier that turned a
+     * few GB of workspace into a multi-hour export — `.venv/lib64 -> lib`
+     * and friends re-walked their target once per link.
+     */
+    @Test
+    fun `does not descend into a symlinked directory`() {
+        File(source, "real").mkdirs()
+        File(source, "real/notes.md").writeText("hello")
+        File(source, "empty-real").mkdirs()
+        Files.createSymbolicLink(
+            File(source, "link-dir").toPath(), File(source, "real").toPath()
+        )
+        Files.createSymbolicLink(
+            File(source, "link-empty").toPath(), File(source, "empty-real").toPath()
+        )
+
+        val (trees, _, indexFile) = exporter()
+        val r = trees.export(source, "chats/sid1", BackupCategory.CHATS, "sid1")
+
+        assertEquals(1, r.filesIncluded)
+        val entries = readIndex(indexFile)
+        assertEquals(
+            listOf("chats/sid1/real/notes.md"),
+            entries.filter { it.sha256 != null }.map { it.path },
+        )
+        // The real empty directory is recorded; the link to it is not —
+        // a directory entry at the link path would restore a real
+        // directory where a link used to be.
+        assertEquals(
+            listOf("chats/sid1/empty-real"),
+            entries.filter { it.isDirectory == true }.map { it.path },
+        )
+    }
+
+    /** A file symlink is followed once: its target's bytes, under the link's path. */
+    @Test
+    fun `a symlinked file stores its target bytes once`() {
+        File(source, "real.bin").writeBytes(byteArrayOf(1, 2, 3))
+        Files.createSymbolicLink(
+            File(source, "alias.bin").toPath(), File(source, "real.bin").toPath()
+        )
+
+        val (trees, blobs, indexFile) = exporter()
+        val r = trees.export(source, "shared", BackupCategory.SHARED_FILES)
+
+        assertEquals("both paths are indexed", 2, r.filesIncluded)
+        assertEquals("identical content stores one blob", 1, blobs.blobIndex.size)
+        val entries = readIndex(indexFile).filter { it.sha256 != null }
+        assertEquals(
+            setOf("shared/real.bin", "shared/alias.bin"),
+            entries.map { it.path }.toSet(),
+        )
+        assertEquals(1, entries.map { it.sha256 }.toSet().size)
+    }
+
+    /**
+     * Hidden entries are skipped wholesale — iOS's `.skipsHiddenFiles` rule.
+     * `.git` alone can be most of a workspace tree, and it is bookkeeping,
+     * not user content.
+     */
+    @Test
+    fun `skips hidden files and directories`() {
+        File(source, ".git/objects").mkdirs()
+        File(source, ".git/objects/blob").writeText("git object")
+        File(source, ".hidden-file").writeText("dot")
+        File(source, ".empty-hidden").mkdirs()
+        File(source, "visible.txt").writeText("seen")
+        File(source, "visible-empty").mkdirs()
+
+        val (trees, _, indexFile) = exporter()
+        val r = trees.export(source, "shared", BackupCategory.SHARED_FILES)
+
+        assertEquals(1, r.filesIncluded)
+        val entries = readIndex(indexFile)
+        assertEquals(
+            listOf("shared/visible.txt"),
+            entries.filter { it.sha256 != null }.map { it.path },
+        )
+        assertEquals(
+            listOf("shared/visible-empty"),
+            entries.filter { it.isDirectory == true }.map { it.path },
+        )
     }
 }
