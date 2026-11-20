@@ -20,7 +20,7 @@ name: Android ZCode debug build
 
 on:
   push:
-    branches: [feat/zcode-android]
+    branches: [feat/zcode-android, main]
   workflow_dispatch:
 
 jobs:
