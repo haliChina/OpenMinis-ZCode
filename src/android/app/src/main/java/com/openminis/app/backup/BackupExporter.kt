@@ -662,12 +662,30 @@ class BackupExporter(
     ): BackupManifest {
         // Integrity covers every packaged file, hashed over whatever bytes
         // actually ship — ciphertext once encryption has run (§5.3).
+        //
+        // Blob members are the exception to re-hashing: BackupBlobStore
+        // files each blob under the SHA-256 of its content and records that
+        // digest in the blob index, so for an UNENCRYPTED package the digest
+        // on record IS the hash of the staged bytes — recomputing it would
+        // re-read every media file in the package for a value already
+        // known. Encrypted packages keep the full re-hash: encryption has
+        // replaced the staged bytes with ciphertext, and §5.3 hashes the
+        // ciphertext, which the index digest does not describe. A staged
+        // blob with no index entry (should not happen — every stored blob
+        // is indexed) falls back to hashing like any other member.
+        val blobDigests: Map<String, String> = if (encryption == null) {
+            blobStore.blobIndex.associate { entry ->
+                "blobs/${entry.sha256.take(2)}/${entry.sha256}" to entry.sha256
+            }
+        } else {
+            emptyMap()
+        }
         val base = staging.canonicalFile
         val integrity = base.walkTopDown()
             .filter { it.isFile && it.name != "manifest.json" } // can't hash itself
             .associate { file ->
-                file.relativeTo(base).path.replace(File.separatorChar, '/') to
-                    BackupBlobStore.sha256OfFile(file)
+                val rel = file.relativeTo(base).path.replace(File.separatorChar, '/')
+                rel to (blobDigests[rel] ?: BackupBlobStore.sha256OfFile(file))
             }
 
         return BackupManifest(
