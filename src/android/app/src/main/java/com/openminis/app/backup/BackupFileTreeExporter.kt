@@ -94,8 +94,15 @@ class BackupFileTreeExporter(
         // under their content hash — the iOS behaviour for a linked file.
         // The root itself is exempt: it is the caller's chosen tree, already
         // canonicalised above.
+        //
+        // Hidden directories are pruned by the same onEnter, and hidden
+        // files are skipped in the loop below — iOS's `.skipsHiddenFiles`
+        // rule. `.git`, `.venv`, `.cache` and friends are tool bookkeeping,
+        // and iOS has never packaged them, so including them here would
+        // inflate the package AND make the two platforms' packages
+        // disagree about the same tree.
         for (entry in base.walkTopDown().onEnter { dir ->
-            dir == base || !isSymlink(dir)
+            dir == base || (!isSymlink(dir) && !isHidden(dir))
         }) {
             if (++scanned % CANCEL_CHECK_EVERY == 0 && isCancelled()) {
                 throw kotlinx.coroutines.CancellationException("Backup stopped")
@@ -110,6 +117,11 @@ class BackupFileTreeExporter(
 
             // Never package a backup artifact — see isBackupArtifact.
             if (isBackupArtifact(rel)) continue
+
+            // Hidden entries — see the onEnter note above. A pruned hidden
+            // directory is still yielded by the walk, so it must be skipped
+            // here too, or an empty one would be recorded below.
+            if (isHidden(entry)) continue
 
             if (entry.isDirectory) {
                 // A directory symlink is still yielded even though onEnter
@@ -200,6 +212,13 @@ class BackupFileTreeExporter(
         } catch (_: Exception) {
             false
         }
+
+    /**
+     * Dot-prefixed name — the rule iOS's `.skipsHiddenFiles` applies to both
+     * files and directories. Deliberately the name check rather than
+     * `File.isHidden`, so the rule is the same on every filesystem.
+     */
+    private fun isHidden(f: File): Boolean = f.name.startsWith(".")
 
     /**
      * True for anything that is itself a backup artifact — a delivered
