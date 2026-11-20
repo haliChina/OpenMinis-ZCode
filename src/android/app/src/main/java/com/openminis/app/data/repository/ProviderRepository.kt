@@ -3217,8 +3217,26 @@ class ProviderRepository(private val context: Context) {
             try {
                 val fresh = com.openminis.app.auth.OAuthManager.forInstance(context, instance)?.validAccessToken()
                 if (fresh != null && fresh != apiKey) {
-                    saveApiKey(instance.id, fresh)
+                    // [T-zcode-provider] Same exclusion as refreshModels:
+                    // the ZCode JWT lives in the OAuth manager's blob and
+                    // is resolved into the local value only. Mirroring it
+                    // into the api-key store leaves a copy that outlives
+                    // the login and keeps the detail card presenting a
+                    // dead token as the current credential.
+                    if (instance.providerType != ProviderType.zcode) {
+                        saveApiKey(instance.id, fresh)
+                    }
                     apiKey = fresh
+                } else if (fresh == null && instance.providerType == ProviderType.zcode &&
+                    loadApiKey(instance.id) != null
+                ) {
+                    // No valid JWT (signed out, or the JWT's own exp has
+                    // passed): drop a mirror written by an earlier build
+                    // so the card and the routing layers stop presenting
+                    // it. The value returned by this call is unchanged —
+                    // the request fails the way it would have — only the
+                    // stale copy goes.
+                    deleteApiKey(instance.id)
                 }
             } catch (e: Exception) {
                 AppLogger.warning("ProviderRepo", "requestCredential: OAuth refresh failed for ${instance.id.take(8)}: ${e.message}")

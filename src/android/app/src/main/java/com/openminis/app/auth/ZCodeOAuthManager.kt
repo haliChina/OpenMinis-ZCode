@@ -38,10 +38,13 @@ import java.security.SecureRandom
  *
  * Token model (official client behaviour — there is NO refresh):
  * the JWT is stored in the standard `oauth_tokens_<id>` blob (so the base
- * [OAuthManager.logout] clears it and backup export/import round-trip it),
- * its `exp` is parsed locally, and once expired the user must log in again
- * — [validAccessToken] returns null past expiry and never attempts a
- * refresh. The provider surfaces that as "登录已过期，请重新登录".
+ * [OAuthManager.logout] clears it and backup export/import round-trip it)
+ * and the user must log in again once it stops working —
+ * [validAccessToken] never attempts a refresh. Real ZCode JWTs carry
+ * NO `exp` claim (payload is iat/sub/token_version/user_id only), so a
+ * token without one is never judged expired locally: the server's 401
+ * is the expiry signal, surfaced as "登录已过期，请重新登录". A JWT that
+ * does carry `exp` is judged by that claim (see [isLocallyExpired]).
  *
  * Single account only. No multi-account pool, no auto-claim, no timers.
  * Billing calls (balance / current / preview / claim) are manual, one shot
@@ -268,7 +271,13 @@ open class ZCodeOAuthManager(
             val userId = data.optJSONObject("user")
                 ?.optString("user_id", "")?.takeIf { it.isNotEmpty() }
                 ?: jwtUserId(token)
-            val expiresAt = jwtExpiryMs(token) ?: (System.currentTimeMillis() + 3600_000)
+            // Real ZCode JWTs have no `exp` claim, so this is normally
+            // 0 — "no local expiry", the same value the import path
+            // writes. The server's 401 decides when the token is dead
+            // (see isLocallyExpired). An earlier version fabricated
+            // now+1h here, which made every in-app login "expire"
+            // 59 minutes later with the request never leaving the phone.
+            val expiresAt = jwtExpiryMs(token) ?: 0
             return JwtResult(token, providerAccess, userId, expiresAt, providerRefresh)
         }
 
@@ -379,6 +388,28 @@ open class ZCodeOAuthManager(
             return if (exp > 0) exp * 1000 else null
         }
 
+        /**
+         * Local expiry decision for a stored token. The TOKEN ITSELF is
+         * the source of truth, not the blob's `expire_at`:
+         *
+         * - A JWT carrying `exp` is judged by that claim (60s early
+         *   margin, as before), whatever the blob stored alongside it.
+         * - A well-formed JWT WITHOUT `exp` — what ZCode actually
+         *   issues — never expires locally, whatever `expire_at` says.
+         *   Blobs written by the old login path carry a fabricated
+         *   login+1h deadline; ignoring it here heals those installs
+         *   in place, no re-login needed. Real death is the server's
+         *   401, handled by the callers.
+         * - A value that does not parse as a JWT at all falls back to
+         *   the stored `expire_at` (0 = no local expiry), preserving
+         *   the pre-fix behaviour for blobs this client did not mint.
+         */
+        fun isLocallyExpired(token: String, storedExpireAtMs: Long, nowMs: Long): Boolean {
+            jwtExpiryMs(token)?.let { return nowMs >= it - 60_000 }
+            if (parseJwtPayload(token) != null) return false
+            return storedExpireAtMs > 0 && nowMs >= storedExpireAtMs - 60_000
+        }
+
         fun jwtUserId(jwt: String): String? =
             parseJwtPayload(jwt)?.optString("user_id", "")
                 ?.ifEmpty { parseJwtPayload(jwt)?.optString("sub", "") }
@@ -425,24 +456,27 @@ open class ZCodeOAuthManager(
     /** The logged-in account's user id, from the JWT payload. */
     suspend fun userId(): String? = validAccessToken()?.let { jwtUserId(it) }
 
-    /** The plan JWT, or null when absent/expired. No refresh exists. */
+    /** The plan JWT, or null when absent or past the JWT's own `exp`.
+     *  A JWT without `exp` (the real ZCode shape) never expires locally
+     *  — the server's 401 decides. No refresh exists. */
     override suspend fun validAccessToken(): String? = withContext(Dispatchers.IO) {
         loadManualBearerToken()?.takeIf { it.isNotEmpty() }?.let { return@withContext it }
         val stored = loadStoredTokens() ?: return@withContext null
         val token = stored.optString("access_token", "").ifEmpty { return@withContext null }
-        val expireAt = stored.optLong("expire_at", 0)
-        if (expireAt > 0 && System.currentTimeMillis() >= expireAt - 60_000) return@withContext null
+        if (isLocallyExpired(token, stored.optLong("expire_at", 0), System.currentTimeMillis())) {
+            return@withContext null
+        }
         token
     }
 
-    /** True while a non-expired JWT is stored. The session token tier
-     *  Copilot has does not exist here — the JWT is the credential. */
+    /** True while a usable JWT is stored (same rule as
+     *  [validAccessToken]). The session token tier Copilot has does
+     *  not exist here — the JWT is the credential. */
     override fun isAuthenticated(): Boolean {
         if (loadManualBearerToken()?.isNotEmpty() == true) return true
         val stored = loadStoredTokens() ?: return false
-        if (stored.optString("access_token", "").isEmpty()) return false
-        val expireAt = stored.optLong("expire_at", 0)
-        return expireAt <= 0 || System.currentTimeMillis() < expireAt - 60_000
+        val token = stored.optString("access_token", "").ifEmpty { return false }
+        return !isLocallyExpired(token, stored.optLong("expire_at", 0), System.currentTimeMillis())
     }
 
     // ── Stage 1: init ──────────────────────────────────────────────────
@@ -884,7 +918,13 @@ open class ZCodeOAuthManager(
 
     private suspend fun billingAuthed(method: String, path: String, jsonBody: JSONObject?): ApiResult {
         val jwt = validAccessToken() ?: throw Exception("未登录 ZCode，登录已过期请重新登录。")
-        return billingRaw(method, path, jwt, jsonBody, allowCaptchaRetry = true)
+        val result = billingRaw(method, path, jwt, jsonBody, allowCaptchaRetry = true)
+        // A server-side dead JWT surfaces as HTTP 401 with an empty
+        // body. Give it the same "log in again" semantics as the
+        // no-token case above (and as the chat path's 401 mapping)
+        // instead of leaking the raw status/body to the console.
+        if (result.httpStatus == 401) throw Exception("未登录 ZCode，登录已过期请重新登录。")
+        return result
     }
 
     /**
