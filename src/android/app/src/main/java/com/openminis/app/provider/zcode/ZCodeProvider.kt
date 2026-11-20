@@ -515,14 +515,13 @@ class ZCodeProvider(
                 if (obj.optString("role") == "user") {
                     val content = obj.getJSONArray("content")
                     for (img in imageParts) {
-                        content.put(JSONObject().apply {
-                            put("type", "image")
-                            put("source", JSONObject().apply {
-                                put("type", "base64")
-                                put("media_type", img.mimeType)
-                                put("data", android.util.Base64.encodeToString(img.data, android.util.Base64.NO_WRAP))
-                            })
-                        })
+                        // [T-attachment-ingest-io] Route through imageBlock,
+                        // like the content-parts images: these used to be
+                        // inlined verbatim (declared mime trusted, no format
+                        // check, no byte budget), bypassing the
+                        // ImageBudget.prepareForUpload gate every other image
+                        // in this provider goes through.
+                        content.put(imageBlock(img.data, img.mimeType))
                     }
                     break
                 }
