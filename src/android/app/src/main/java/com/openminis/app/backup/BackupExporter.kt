@@ -136,7 +136,7 @@ class BackupExporter(
                 if (BackupCategory.CHATS in options.categories) {
                     onProgress?.invoke("Exporting chats…")
                     stats[BackupCategory.CHATS.key] =
-                        exportChats(dataDir, trees, options.snapshotAtMillis)
+                        exportChats(dataDir, trees, options.snapshotAtMillis, onProgress)
                 }
                 if (BackupCategory.SHARED_FILES in options.categories) {
                     onProgress?.invoke("Exporting shared files…")
@@ -254,6 +254,7 @@ class BackupExporter(
         dataDir: File,
         trees: BackupFileTreeExporter,
         snapshotAtMillis: Long,
+        onProgress: ((String) -> Unit)?,
     ): BackupManifest.CategoryStat {
         val dao = db.chatDao()
         var messageCount = 0
@@ -265,7 +266,29 @@ class BackupExporter(
             BackupJsonlWriter(dataDir, "messages").use { messages ->
                 BackupJsonlWriter(dataDir, "compact_markers").use { markers ->
                     BackupJsonlWriter(dataDir, "folders").use { folders ->
-                        for (session in dao.listSessions()) {
+                        val allSessions = dao.listSessions()
+                        val total = allSessions.size
+                        var visited = 0
+                        var lastProgressAt = 0L
+                        for (session in allSessions) {
+                            // Per-session progress, mirroring iOS's
+                            // BackupProgressReporter: counted at visit time,
+                            // BEFORE the snapshot filter below, so the number
+                            // always advances — a run whose tail is all
+                            // newer-than-snapshot sessions would otherwise
+                            // appear to stall just before finishing. Throttled
+                            // to one line a second (the last session always
+                            // reports), because every line lands in the run
+                            // log and a multi-thousand-session export must not
+                            // flood it with a row per session.
+                            visited += 1
+                            if (onProgress != null && total > 1) {
+                                val now = System.currentTimeMillis()
+                                if (visited == total || now - lastProgressAt >= PROGRESS_INTERVAL_MS) {
+                                    lastProgressAt = now
+                                    onProgress("Exporting chats… ($visited/$total)")
+                                }
+                            }
                             // Snapshot cut-off: a session updated after the user
                             // pressed Create Backup is not part of this backup's
                             // view. Excluding the WHOLE session rather than
@@ -719,6 +742,9 @@ class BackupExporter(
 
     companion object {
         private const val TAG = "Backup"
+
+        /** Minimum gap between per-session chats progress lines (iOS: 1s). */
+        private const val PROGRESS_INTERVAL_MS = 1_000L
 
         /**
          * Process-wide export/restore lock. Both read the same stores, and a
