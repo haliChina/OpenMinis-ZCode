@@ -109,8 +109,20 @@ object ReadImageTool {
      */
     internal fun imageResult(file: java.io.File, path: String, toolTitle: String): ToolExecutionResult {
             val codec = ImageBudget.codec
-            val original = codec.decodeFile(file.absolutePath)
-                ?: return ToolExecutionResult(failureText(path, resolved = true, file = file), false, toolTitle = toolTitle)
+            // [T-attachment-ingest-io] decodeFile is a full-resolution decode:
+            // a huge image (e.g. an un-downscaled original sitting in the
+            // uploads dir) OOMs here, and OutOfMemoryError is an Error — it
+            // sails straight past execute()'s catch (e: Exception) and kills
+            // the process mid-turn. Degrade to a tool error instead.
+            val original = try {
+                codec.decodeFile(file.absolutePath)
+            } catch (e: OutOfMemoryError) {
+                return ToolExecutionResult(
+                    "Error: '$path' is too large to decode into memory (${file.length()} bytes).",
+                    false,
+                    toolTitle = toolTitle,
+                )
+            } ?: return ToolExecutionResult(failureText(path, resolved = true, file = file), false, toolTitle = toolTitle)
 
             val maxEdge = 2000
             val scaled = if (codec.width(original) > maxEdge || codec.height(original) > maxEdge) {

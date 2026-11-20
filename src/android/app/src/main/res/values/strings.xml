@@ -2003,6 +2003,9 @@
     <!-- T-imgsize: composer-side image-budget Snackbar messages -->
     <string name="image_input_rejected_hint">The request included %1$d image(s) and this model may not accept image input — try a vision-capable model, or turn off “Image Input” for it in the model’s details.</string>
     <string name="image_budget_total_exceeded">Total image size exceeds 25MB; later images dropped</string>
+    <!-- T-attachment-ingest-io: ingest size-cap skip Snackbar messages -->
+    <string name="attachment_too_large_skipped">%1$s is too large to attach and was not sent</string>
+    <string name="attachments_too_large_skipped">%1$d attachments were too large and were not sent</string>
     <!-- T-request-imgsize: request-level image-budget Snackbar message -->
     <string name="composer_swipe_release_to_send">Release to send</string>
     <string name="composer_swipe_release_to_queue">Release to queue</string>

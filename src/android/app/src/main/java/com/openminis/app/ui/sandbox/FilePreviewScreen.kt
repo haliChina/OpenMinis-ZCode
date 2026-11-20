@@ -6,7 +6,6 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.pdf.PdfRenderer
 import android.net.Uri
 import android.os.Build
@@ -96,6 +95,28 @@ import com.openminis.app.ui.components.MinisTextButton
 import com.openminis.app.ui.components.safeLaunchPicker
 
 private const val MAX_TEXT_PREVIEW_BYTES = 512_000 // 500 KB
+
+/**
+ * [T-attachment-ingest-io] Read at most [maxBytes] + 1 bytes of [file]. The
+ * text previews only ever display the first MAX_TEXT_PREVIEW_BYTES, but
+ * they used to readBytes() the WHOLE file and truncate afterwards — the
+ * truncation bounded the string, not the memory, so previewing a multi-GB
+ * log loaded it all first. Reading one byte past the cap keeps the
+ * callers' `size > cap` truncation checks exact.
+ */
+private fun readBytesCapped(file: java.io.File, maxBytes: Int): ByteArray =
+    file.inputStream().use { input ->
+        val out = java.io.ByteArrayOutputStream()
+        val buf = ByteArray(64 * 1024)
+        var remaining = maxBytes + 1
+        while (remaining > 0) {
+            val n = input.read(buf, 0, minOf(buf.size, remaining))
+            if (n < 0) break
+            out.write(buf, 0, n)
+            remaining -= n
+        }
+        out.toByteArray()
+    }
 
 @Composable
 fun FilePreviewScreen(
@@ -357,7 +378,13 @@ internal fun ImagePreview(item: FileItem) {
     LaunchedEffect(item.file) {
         withContext(Dispatchers.IO) {
             try {
-                val bmp = BitmapFactory.decodeFile(item.file.absolutePath)
+                // [T-attachment-ingest-io] Bounded decode via the display
+                // helper: a bare decodeFile loads the image at full
+                // resolution, so a huge workspace image OOM-aborted here
+                // (the catch below only sees Exception). decodeFileBounded
+                // samples down to the display ceiling and returns null on
+                // any failure, which lands on the decode-error path.
+                val bmp = com.openminis.app.ui.DisplayBitmapLimits.decodeFileBounded(item.file.absolutePath)
                 if (bmp != null) {
                     bitmap = bmp
                 } else {
@@ -438,7 +465,7 @@ internal fun TextPreview(item: FileItem) {
     LaunchedEffect(item.file) {
         withContext(Dispatchers.IO) {
             try {
-                val bytes = item.file.readBytes()
+                val bytes = readBytesCapped(item.file, MAX_TEXT_PREVIEW_BYTES)
                 if (bytes.size > MAX_TEXT_PREVIEW_BYTES) {
                     content = String(bytes, 0, MAX_TEXT_PREVIEW_BYTES, Charsets.UTF_8)
                     truncated = true
@@ -524,7 +551,7 @@ private fun MarkdownPreview(item: FileItem, onLink: (String) -> Unit) {
     LaunchedEffect(item.file) {
         withContext(Dispatchers.IO) {
             try {
-                val bytes = item.file.readBytes()
+                val bytes = readBytesCapped(item.file, MAX_TEXT_PREVIEW_BYTES)
                 val cap = if (bytes.size > MAX_TEXT_PREVIEW_BYTES) MAX_TEXT_PREVIEW_BYTES else bytes.size
                 content = String(bytes, 0, cap, Charsets.UTF_8)
             } catch (e: Exception) {
@@ -854,7 +881,7 @@ private fun JsonPreview(item: FileItem) {
     LaunchedEffect(item.file) {
         withContext(Dispatchers.IO) {
             try {
-                val bytes = item.file.readBytes()
+                val bytes = readBytesCapped(item.file, MAX_TEXT_PREVIEW_BYTES)
                 val cap = if (bytes.size > MAX_TEXT_PREVIEW_BYTES) {
                     truncated = true; MAX_TEXT_PREVIEW_BYTES
                 } else bytes.size
@@ -1404,7 +1431,7 @@ private fun printFile(context: Context, item: FileItem) {
         if (item.isHtmlFile) {
             webView.loadUrl("file://${item.file.absolutePath}")
         } else {
-            val raw = item.file.readBytes().let { bytes ->
+            val raw = readBytesCapped(item.file, MAX_TEXT_PREVIEW_BYTES).let { bytes ->
                 val cap = if (bytes.size > MAX_TEXT_PREVIEW_BYTES) MAX_TEXT_PREVIEW_BYTES else bytes.size
                 String(bytes, 0, cap, Charsets.UTF_8)
             }
