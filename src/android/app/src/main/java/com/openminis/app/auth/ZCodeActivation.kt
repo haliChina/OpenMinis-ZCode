@@ -2,6 +2,7 @@ package com.openminis.app.auth
 
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.Locale
 import java.util.UUID
 
 /**
@@ -625,5 +626,27 @@ object ZCodeActivation {
             }
         }
         return BalanceDetail(plans, buckets)
+    }
+
+    // ── Quota bar helpers ─────────────────────────────────────────────
+
+    /** Remaining fraction of one bucket, for the console quota bar:
+     *  null when the numbers cannot support a bar (total unknown or
+     *  non-positive, remaining unknown); otherwise remaining/total
+     *  clamped to 0f..1f (a bucket can transiently report remaining
+     *  above total, and the bar must not overfill). */
+    fun quotaFraction(remaining: Long, total: Long): Float? {
+        if (total <= 0 || remaining < 0) return null
+        return (remaining.toDouble() / total.toDouble()).toFloat().coerceIn(0f, 1f)
+    }
+
+    /** "剩余 85.6%" label under the quota bar; null under the same
+     *  conditions as [quotaFraction]. One decimal place, pinned to
+     *  Locale.US so the separator never flips to a comma. The percent
+     *  is computed from the clamped fraction, so it can never read
+     *  above 100.0%. */
+    fun quotaPercentText(remaining: Long, total: Long): String? {
+        val fraction = quotaFraction(remaining, total) ?: return null
+        return "剩余 " + String.format(Locale.US, "%.1f%%", fraction * 100f)
     }
 }

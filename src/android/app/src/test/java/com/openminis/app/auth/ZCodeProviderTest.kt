@@ -19,6 +19,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.Base64
@@ -992,6 +994,38 @@ class ZCodeProviderTest {
         assertEquals(listOf("model:GLM-5.3-Flash"), detail.buckets[0].capabilities)
         assertEquals("2026-11-08", detail.buckets[1].expiresAt)
         assertTrue(ZCodeActivation.parseBalanceDetail("garbage").buckets.isEmpty())
+    }
+
+    // ── Quota bar helpers ─────────────────────────────────────────────
+
+    @Test
+    fun `quota fraction is null when total or remaining cannot support a bar`() {
+        assertNull(ZCodeActivation.quotaFraction(100, 0))
+        assertNull(ZCodeActivation.quotaFraction(100, -5))
+        assertNull(ZCodeActivation.quotaFraction(-1, 500))
+        assertNull(ZCodeActivation.quotaFraction(-1, -1))
+    }
+
+    @Test
+    fun `quota fraction matches the live weekend bucket and clamps to unit range`() {
+        // The bucket the user actually saw: 428184827 / 500000000.
+        val fraction = ZCodeActivation.quotaFraction(428184827, 500000000)
+        assertNotNull(fraction)
+        assertEquals(0.8564, fraction!!.toDouble(), 0.001)
+        assertEquals(0f, ZCodeActivation.quotaFraction(0, 500))
+        assertEquals(1f, ZCodeActivation.quotaFraction(500, 500))
+        // remaining above total clamps instead of overfilling the bar.
+        assertEquals(1f, ZCodeActivation.quotaFraction(600, 500))
+    }
+
+    @Test
+    fun `quota percent text formats one decimal and mirrors the null cases`() {
+        assertEquals("剩余 85.6%", ZCodeActivation.quotaPercentText(428184827, 500000000))
+        assertEquals("剩余 100.0%", ZCodeActivation.quotaPercentText(500, 500))
+        assertEquals("剩余 100.0%", ZCodeActivation.quotaPercentText(600, 500))
+        assertEquals("剩余 0.0%", ZCodeActivation.quotaPercentText(0, 500))
+        assertNull(ZCodeActivation.quotaPercentText(100, 0))
+        assertNull(ZCodeActivation.quotaPercentText(-1, 500))
     }
 
     // ── Model id normalization + wire form (#22, #23) ─────────────────
