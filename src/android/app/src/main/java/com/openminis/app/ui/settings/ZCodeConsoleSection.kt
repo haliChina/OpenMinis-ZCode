@@ -26,7 +26,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -36,6 +38,7 @@ import com.openminis.app.auth.ZCodeConstants
 import com.openminis.app.auth.ZCodeOAuthManager
 import com.openminis.app.data.model.ProviderInstance
 import com.openminis.app.data.repository.ProviderRepository
+import com.openminis.app.service.ZCodeBroadcastController
 import com.openminis.app.ui.components.MinisButton
 import kotlinx.coroutines.launch
 import org.json.JSONObject
@@ -571,6 +574,121 @@ fun ColumnScope.ZCodeConsoleSection(
                     }
                 }
             }
+        }
+    }
+
+    ZCodeBroadcastSection(instance, manager)
+}
+
+// ── Broadcast section ──────────────────────────────────────────────
+
+/**
+ * [T-zcode-broadcast] The 本机广播 block under the console: switch,
+ * live status, the access key (copy / reset), and the LAN opt-in.
+ * All state lives in [ZCodeBroadcastController] (process-wide, not
+ * persisted — a dead process means a stopped broadcast, and the
+ * switch must say so); the key and the LAN preference live in the
+ * manager's encrypted store.
+ */
+@Composable
+private fun ColumnScope.ZCodeBroadcastSection(
+    instance: ProviderInstance,
+    manager: ZCodeOAuthManager,
+) {
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    val broadcastState by ZCodeBroadcastController.state.collectAsState()
+    var accessKey by remember(instance.id) { mutableStateOf(manager.broadcastAccessKey()) }
+    var allowLan by remember(instance.id) { mutableStateOf(manager.broadcastAllowLan()) }
+    var note by remember(instance.id) { mutableStateOf<String?>(null) }
+
+    val runningHere = (broadcastState as? ZCodeBroadcastController.State.Running)
+        ?.takeIf { it.instanceId == instance.id }
+    val startingHere = (broadcastState as? ZCodeBroadcastController.State.Starting)
+        ?.takeIf { it.instanceId == instance.id }
+    val failedHere = (broadcastState as? ZCodeBroadcastController.State.Failed)
+        ?.takeIf { it.instanceId == instance.id }
+    val runningElsewhere = (broadcastState as? ZCodeBroadcastController.State.Running)
+        ?.takeIf { it.instanceId != instance.id }
+
+    val statusText = when {
+        runningHere != null -> "运行中 · ${runningHere.host}:${runningHere.port}"
+        startingHere != null -> "正在启动…"
+        failedHere != null -> failedHere.message
+        runningElsewhere != null -> "已在另一个 ZCode 实例上运行（开启将切换到此实例）"
+        else -> "已停止"
+    }
+
+    SettingsSection(
+        header = "本机广播",
+        footer = "把这个实例以 Anthropic 格式开放给本机的其他 app：端点 http://127.0.0.1:8799，请求带下方访问密钥（Authorization: Bearer 或 x-api-key）。广播与聊天共用这个账号的并发（合计 2）；实例未登录或令牌失效时，调用方收到未登录报错。广播运行期间有一条常驻通知，关掉开关即停止。",
+    ) {
+        SettingsSwitchRow(
+            title = "本机广播",
+            subtitle = statusText,
+            checked = runningHere != null || startingHere != null,
+            onCheckedChange = { on ->
+                note = null
+                if (on) {
+                    accessKey = manager.ensureBroadcastAccessKey()
+                    ZCodeBroadcastController.requestStart(context, instance.id, allowLan)
+                } else {
+                    ZCodeBroadcastController.requestStop()
+                }
+            },
+        )
+        SettingsSwitchRow(
+            title = "允许局域网访问",
+            subtitle = "开启后改绑 0.0.0.0，同一局域网内的设备也能用访问密钥调用",
+            checked = allowLan,
+            onCheckedChange = { allowed ->
+                allowLan = allowed
+                manager.setBroadcastAllowLan(allowed)
+                note = null
+                // Binding changes apply by restarting the service.
+                if (runningHere != null || startingHere != null) {
+                    ZCodeBroadcastController.requestStart(context, instance.id, allowed)
+                }
+            },
+        )
+        if (allowLan) {
+            Text(
+                "风险提示：局域网内任何拿到访问密钥的设备都能消耗这个账号的额度，只在可信网络开启。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+            )
+        }
+        SettingsRow(
+            title = "访问密钥",
+            subtitle = accessKey ?: "开启广播后自动生成",
+            showDivider = false,
+            trailing = {
+                androidx.compose.foundation.layout.Row {
+                    TextButton(
+                        onClick = {
+                            val key = accessKey ?: manager.ensureBroadcastAccessKey()
+                                .also { accessKey = it }
+                            clipboard.setText(AnnotatedString(key))
+                            note = "访问密钥已复制。"
+                        },
+                    ) { Text("复制") }
+                    TextButton(
+                        onClick = {
+                            accessKey = manager.resetBroadcastAccessKey()
+                            note = "访问密钥已重置，旧密钥立即失效。"
+                        },
+                    ) { Text("重置") }
+                }
+            },
+        )
+        if (note != null) {
+            Text(
+                note!!,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+            )
         }
     }
 }

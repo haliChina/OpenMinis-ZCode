@@ -1469,6 +1469,9 @@
     <string name="backup_save_failed">保存到设备失败：%1$s</string>
     <string name="backup_share_failed">无法打开分享面板。</string>
     <string name="backup_notif_channel">备份</string>
+    <string name="zcode_broadcast_notif_channel">ZCode 本机广播</string>
+    <string name="zcode_broadcast_notif_title">ZCode 本机广播运行中</string>
+    <string name="zcode_broadcast_stop">停止广播</string>
     <string name="oauth_wait_notif_channel">登录</string>
     <string name="oauth_wait_notif_title">正在等待登录…</string>
     <string name="oauth_wait_notif_text">请在浏览器中完成登录，然后返回 Minis。</string>

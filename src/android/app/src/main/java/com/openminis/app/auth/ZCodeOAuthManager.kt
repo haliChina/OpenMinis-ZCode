@@ -139,6 +139,13 @@ open class ZCodeOAuthManager(
         /** Adopted client version override (#19), e.g. "3.17.2". */
         private const val KEY_CLIENT_VERSION = "zcode_client_version"
 
+        /** Broadcast access key (in-app local endpoint's own gate,
+         *  unrelated to the ZCode account credential). */
+        private const val KEY_BROADCAST_ACCESS_KEY = "zcode_broadcast_access_key"
+
+        /** Broadcast "allow LAN access" preference ("1"/"0"). */
+        private const val KEY_BROADCAST_ALLOW_LAN = "zcode_broadcast_allow_lan"
+
         /** 5 days between manifest checks (#19). */
         const val VERSION_CHECK_INTERVAL_MS = 5 * 24 * 60 * 60 * 1000L
 
@@ -639,6 +646,43 @@ open class ZCodeOAuthManager(
         val fresh = java.util.UUID.randomUUID().toString()
         saveOAuthString(KEY_DEVICE_MID, fresh)
         return fresh
+    }
+
+    // ── Broadcast (in-app local endpoint) ──────────────────────────────
+
+    /**
+     * [T-zcode-broadcast] The broadcast access key for THIS instance,
+     * or null when none was ever generated. Stored with
+     * [saveOAuthString] — the same encrypted store as the device id —
+     * because it is a live credential for this account's quota: any
+     * app on the device presenting it can spend the plan.
+     */
+    fun broadcastAccessKey(): String? =
+        loadOAuthString(KEY_BROADCAST_ACCESS_KEY)?.takeIf { it.isNotBlank() }
+
+    /** The stored key, generating and persisting one on first use. */
+    fun ensureBroadcastAccessKey(): String =
+        broadcastAccessKey() ?: run {
+            val fresh = com.openminis.app.provider.zcode.ZCodeBroadcast.generateAccessKey()
+            saveOAuthString(KEY_BROADCAST_ACCESS_KEY, fresh)
+            fresh
+        }
+
+    /** Replace the key; the old one stops validating immediately
+     *  (the server reads the store per request). */
+    fun resetBroadcastAccessKey(): String {
+        val fresh = com.openminis.app.provider.zcode.ZCodeBroadcast.generateAccessKey()
+        saveOAuthString(KEY_BROADCAST_ACCESS_KEY, fresh)
+        return fresh
+    }
+
+    /** Whether the broadcast may bind 0.0.0.0 (LAN) instead of
+     *  loopback only. Default off; persisted per instance. */
+    fun broadcastAllowLan(): Boolean =
+        loadOAuthString(KEY_BROADCAST_ALLOW_LAN) == "1"
+
+    fun setBroadcastAllowLan(allow: Boolean) {
+        saveOAuthString(KEY_BROADCAST_ALLOW_LAN, if (allow) "1" else "0")
     }
 
     private fun sanitizedError(body: String): String =
