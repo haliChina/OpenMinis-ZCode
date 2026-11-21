@@ -25,6 +25,11 @@
          the agent service (moved to mediaPlayback over the 6h/24h cap), a
          backup is finite, and the service handles onTimeout by stopping. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- [T-zcode-broadcast] ZCodeBroadcastService is a specialUse service
+         (a user-toggled local API endpoint has no time budget, unlike
+         dataSync): required on Android 14+ to call startForeground with
+         that type. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <!-- T50: PARTIAL_WAKE_LOCK held by AgentForegroundService while sessions
          are streaming so Doze + OEM CPU throttling don't stall long shell
          tools after screen-off. -->
@@ -509,6 +514,22 @@
             android:name=".service.OAuthWaitService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!-- [T-zcode-broadcast] Keeps the process alive while the in-app
+             ZCode broadcast (a local Anthropic endpoint on 127.0.0.1:8799
+             for other apps on this device) is switched on. specialUse:
+             the endpoint is user-toggled and unbounded in time, so the
+             dataSync budget does not fit; the subtype property below is
+             the declaration Android 14+ requires for this type. Started
+             only from the ZCode console switch; stops with it. -->
+        <service
+            android:name=".service.ZCodeBroadcastService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Local HTTP endpoint that exposes the signed-in ZCode provider to other apps on this device, toggled by the user in the ZCode console." />
+        </service>
 
         <!-- Alarm broadcast receiver (also handles BOOT_COMPLETED and
              MY_PACKAGE_REPLACED for re-scheduling). [T-android-alarm-reschedule-on-restart]

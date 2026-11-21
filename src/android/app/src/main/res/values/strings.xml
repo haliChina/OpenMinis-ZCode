@@ -1618,6 +1618,9 @@
     <string name="backup_save_failed">Couldn\'t save to device: %1$s</string>
     <string name="backup_share_failed">Couldn\'t open the share sheet.</string>
     <string name="backup_notif_channel">Backups</string>
+    <string name="zcode_broadcast_notif_channel">ZCode broadcast</string>
+    <string name="zcode_broadcast_notif_title">ZCode local broadcast is running</string>
+    <string name="zcode_broadcast_stop">Stop broadcast</string>
     <string name="oauth_wait_notif_channel">Sign-in</string>
     <string name="oauth_wait_notif_title">Waiting for sign-in…</string>
     <string name="oauth_wait_notif_text">Finish signing in in the browser, then return to Minis.</string>
