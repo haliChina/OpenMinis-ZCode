@@ -41,6 +41,7 @@ import com.openminis.app.data.model.ProviderInstance
 import com.openminis.app.data.repository.ProviderRepository
 import com.openminis.app.service.ZCodeBroadcastController
 import com.openminis.app.ui.components.MinisButton
+import com.openminis.app.ui.components.MinisOutlinedButton
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 
@@ -348,21 +349,6 @@ fun ColumnScope.ZCodeConsoleSection(
                 Spacer(Modifier.height(8.dp))
                 MinisButton(
                     onClick = {
-                        runAction("查额度") {
-                            balanceResult = manager.fetchBillingBalance()
-                            currentResult = manager.fetchBillingCurrent()
-                            planMode = manager.refreshPlanMode()
-                            val r = balanceResult!!
-                            statusLine = if (r.captchaCancelled) "已取消验证，未扣额度。"
-                            else "额度已读取（HTTP ${r.httpStatus}）。"
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled = busy == null,
-                ) { Text(if (busy == "查额度") "查询中…" else "查额度") }
-                Spacer(Modifier.height(8.dp))
-                MinisButton(
-                    onClick = {
                         runAction("查可领") {
                             // Activation first (manual tap only, no timer,
                             // no daily gate — upstream dedupes by device
@@ -420,87 +406,45 @@ fun ColumnScope.ZCodeConsoleSection(
                     enabled = busy == null,
                 ) { Text(if (busy == "查可领") "查询中…" else "查可领") }
                 Spacer(Modifier.height(8.dp))
-                MinisButton(
-                    onClick = {
-                        val plan = selectedPlan ?: return@MinisButton
-                        runAction("领取") {
-                            val uid = manager.userId().orEmpty()
-                            // #11: already claimed today — do not repeat.
-                            if (uid.isNotEmpty() && manager.isClaimedToday(uid, plan.id)) {
-                                statusLine = "今天已领过 ${plan.id}，不再重复领取。"
-                                return@runAction
-                            }
-                            // #9: 3 consecutive 1005s block the plan for
-                            // 30 minutes.
-                            if (manager.isClaimBlocked(plan.id)) {
-                                statusLine = "该计划因连续 3 次名额用完，30 分钟内不再尝试。"
-                                return@runAction
-                            }
-                            claimResult = manager.claimPlan(plan.id)
-                            val r = claimResult!!
-                            statusLine = when {
-                                r.captchaCancelled -> "已取消验证，未扣额度。"
-                                r.code == 1005 -> {
-                                    manager.recordClaim1005(plan.id)
-                                    val next = ZCodeActivation.parseClaimNextAvailableAt(r.body)
-                                    // #9 self-heal: refresh the balance
-                                    // and re-check instead of trusting
-                                    // the stale read.
-                                    balanceResult = manager.fetchBillingBalance()
-                                    val cc = ZCodeActivation.crossCheckPlan(
-                                        balanceResult!!.body,
-                                        currentResult?.body.orEmpty(),
-                                    )
-                                    "领取结果：名额已用完（code=1005）" +
-                                        (if (next != null) "，下次可领时间：$next" else "") +
-                                        "；${cc.summary}。"
-                                }
-                                r.code == 1003 -> {
-                                    manager.resetClaimCircuit(plan.id)
-                                    if (uid.isNotEmpty()) manager.recordClaimedToday(uid, plan.id)
-                                    "领取结果：已领取过（code=1003）。"
-                                }
-                                ZCodeActivation.claimSucceeded(r.code, r.body) -> {
-                                    manager.resetClaimCircuit(plan.id)
-                                    if (uid.isNotEmpty()) manager.recordClaimedToday(uid, plan.id)
-                                    // #7: touch confirm receipt —
-                                    // best-effort, never blocks the result.
-                                    if (plan.campaignId.isNotEmpty()) {
-                                        manager.confirmTouchAction(plan.campaignId)
-                                    }
-                                    balanceResult = manager.fetchBillingBalance()
-                                    planMode = manager.refreshPlanMode()
-                                    "领取成功：${plan.name}。"
-                                }
-                                r.code != null -> "领取结果：${ZCodeConstants.claimCodeMeaning(r.code)}（code=${r.code}）"
-                                else -> "领取返回 HTTP ${r.httpStatus}。"
-                            }
-                        }
-                    },
+                androidx.compose.foundation.layout.Row(
+                    horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(8.dp),
                     modifier = Modifier.fillMaxWidth(),
-                    enabled = busy == null && selectedPlan != null,
-                ) { Text(if (busy == "领取") "领取中…" else "领取选中计划") }
-                Spacer(Modifier.height(8.dp))
-                MinisButton(
-                    onClick = {
-                        runAction("预取验证") {
-                            val config = manager.fetchCaptchaConfig()
-                            if (config.skipModelRequest) {
-                                prefetchStatus = "当前配置跳过模型请求验证，无需预取。"
-                                return@runAction
+                ) {
+                    MinisOutlinedButton(
+                        onClick = {
+                            runAction("查额度") {
+                                balanceResult = manager.fetchBillingBalance()
+                                currentResult = manager.fetchBillingCurrent()
+                                planMode = manager.refreshPlanMode()
+                                val r = balanceResult!!
+                                statusLine = if (r.captchaCancelled) "已取消验证，未扣额度。"
+                                else "额度已读取（HTTP ${r.httpStatus}）。"
                             }
-                            val param = ZCodeCaptchaGate.requestPrefetch(config)
-                            if (param != null) {
-                                ZCodeCaptchaGate.cachePrefetchedParam(param)
-                                prefetchStatus = "已预取验证（45 秒内有效，下次验证不再弹窗）。"
-                            } else {
-                                prefetchStatus = "预取未完成（已取消或无验证弹窗）。"
+                        },
+                        modifier = Modifier.weight(1f),
+                        enabled = busy == null,
+                    ) { Text(if (busy == "查额度") "查询中…" else "查额度") }
+                    MinisOutlinedButton(
+                        onClick = {
+                            runAction("预取验证") {
+                                val config = manager.fetchCaptchaConfig()
+                                if (config.skipModelRequest) {
+                                    prefetchStatus = "当前配置跳过模型请求验证，无需预取。"
+                                    return@runAction
+                                }
+                                val param = ZCodeCaptchaGate.requestPrefetch(config)
+                                if (param != null) {
+                                    ZCodeCaptchaGate.cachePrefetchedParam(param)
+                                    prefetchStatus = "已预取验证（45 秒内有效，下次验证不再弹窗）。"
+                                } else {
+                                    prefetchStatus = "预取未完成（已取消或无验证弹窗）。"
+                                }
                             }
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled = busy == null,
-                ) { Text(if (busy == "预取验证") "预取中…" else "预取验证") }
+                        },
+                        modifier = Modifier.weight(1f),
+                        enabled = busy == null,
+                    ) { Text(if (busy == "预取验证") "预取中…" else "预取验证") }
+                }
 
                 if (statusLine != null) {
                     Spacer(Modifier.height(8.dp))
@@ -586,6 +530,75 @@ fun ColumnScope.ZCodeConsoleSection(
                             "提示：当前套餐疑似缺 " + missing.joinToString("、") {
                                 if (it == "weekend") "周末包" else "每日包"
                             } + "（按 current 的计划 id 启发式判断，仅供参考）。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    MinisButton(
+                        onClick = {
+                            val plan = selectedPlan ?: return@MinisButton
+                            runAction("领取") {
+                                val uid = manager.userId().orEmpty()
+                                // #11: already claimed today — do not repeat.
+                                if (uid.isNotEmpty() && manager.isClaimedToday(uid, plan.id)) {
+                                    statusLine = "今天已领过 ${plan.id}，不再重复领取。"
+                                    return@runAction
+                                }
+                                // #9: 3 consecutive 1005s block the plan for
+                                // 30 minutes.
+                                if (manager.isClaimBlocked(plan.id)) {
+                                    statusLine = "该计划因连续 3 次名额用完，30 分钟内不再尝试。"
+                                    return@runAction
+                                }
+                                claimResult = manager.claimPlan(plan.id)
+                                val r = claimResult!!
+                                statusLine = when {
+                                    r.captchaCancelled -> "已取消验证，未扣额度。"
+                                    r.code == 1005 -> {
+                                        manager.recordClaim1005(plan.id)
+                                        val next = ZCodeActivation.parseClaimNextAvailableAt(r.body)
+                                        // #9 self-heal: refresh the balance
+                                        // and re-check instead of trusting
+                                        // the stale read.
+                                        balanceResult = manager.fetchBillingBalance()
+                                        val cc = ZCodeActivation.crossCheckPlan(
+                                            balanceResult!!.body,
+                                            currentResult?.body.orEmpty(),
+                                        )
+                                        "领取结果：名额已用完（code=1005）" +
+                                            (if (next != null) "，下次可领时间：$next" else "") +
+                                            "；${cc.summary}。"
+                                    }
+                                    r.code == 1003 -> {
+                                        manager.resetClaimCircuit(plan.id)
+                                        if (uid.isNotEmpty()) manager.recordClaimedToday(uid, plan.id)
+                                        "领取结果：已领取过（code=1003）。"
+                                    }
+                                    ZCodeActivation.claimSucceeded(r.code, r.body) -> {
+                                        manager.resetClaimCircuit(plan.id)
+                                        if (uid.isNotEmpty()) manager.recordClaimedToday(uid, plan.id)
+                                        // #7: touch confirm receipt —
+                                        // best-effort, never blocks the result.
+                                        if (plan.campaignId.isNotEmpty()) {
+                                            manager.confirmTouchAction(plan.campaignId)
+                                        }
+                                        balanceResult = manager.fetchBillingBalance()
+                                        planMode = manager.refreshPlanMode()
+                                        "领取成功：${plan.name}。"
+                                    }
+                                    r.code != null -> "领取结果：${ZCodeConstants.claimCodeMeaning(r.code)}（code=${r.code}）"
+                                    else -> "领取返回 HTTP ${r.httpStatus}。"
+                                }
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = busy == null && selectedPlan != null,
+                    ) { Text(if (busy == "领取") "领取中…" else "领取选中计划") }
+                    if (selectedPlan == null) {
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "先在上方列表里点选一个计划，再领取。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
