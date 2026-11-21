@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -174,24 +175,27 @@ fun ZCodeCaptchaDialog() {
 
 // ── Console section ────────────────────────────────────────────────────
 
-private fun parseBalanceSummary(body: String): List<String> {
-    val detail = ZCodeActivation.parseBalanceDetail(body)
-    val lines = mutableListOf<String>()
-    for (b in detail.buckets) {
-        lines.add(
-            listOfNotNull(
-                b.name.ifEmpty { null },
-                if (b.remaining >= 0) "剩余 ${b.remaining}" else null,
-                if (b.total >= 0) "/ 共 ${b.total}" else null,
-                if (b.used >= 0) "(已用 ${b.used})" else null,
-                b.periodLabel.ifEmpty { null },
-                if (b.capabilities.isNotEmpty()) "能力 ${b.capabilities.joinToString(",")}" else null,
-                if (b.expiresAt.isNotEmpty()) "到期 ${b.expiresAt}" else null,
-            ).joinToString(" ").ifEmpty { "（空）" },
-        )
+/** One balance bucket's summary line, text identical to what the
+ *  console has always shown (name / remaining / total / used /
+ *  period / capabilities / expiry). */
+private fun balanceSummaryLine(b: ZCodeActivation.BalanceBucket): String =
+    listOfNotNull(
+        b.name.ifEmpty { null },
+        if (b.remaining >= 0) "剩余 ${b.remaining}" else null,
+        if (b.total >= 0) "/ 共 ${b.total}" else null,
+        if (b.used >= 0) "(已用 ${b.used})" else null,
+        b.periodLabel.ifEmpty { null },
+        if (b.capabilities.isNotEmpty()) "能力 ${b.capabilities.joinToString(",")}" else null,
+        if (b.expiresAt.isNotEmpty()) "到期 ${b.expiresAt}" else null,
+    ).joinToString(" ").ifEmpty { "（空）" }
+
+/** (summary line, bucket) rows for the 额度 block: the line is the
+ *  display text, the bucket rides along so the row can draw its
+ *  quota bar from the same parse. */
+private fun parseBalanceSummary(body: String): List<Pair<String, ZCodeActivation.BalanceBucket>> =
+    ZCodeActivation.parseBalanceDetail(body).buckets.map { bucket ->
+        balanceSummaryLine(bucket) to bucket
     }
-    return lines
-}
 
 private fun parsePlanNames(body: String): List<String> {
     val names = mutableListOf<String>()
@@ -451,12 +455,34 @@ fun ColumnScope.ZCodeConsoleSection(
                     Text(prefetchStatus!!, style = MaterialTheme.typography.bodyMedium)
                 }
 
-                val balanceLines = balanceResult?.let { parseBalanceSummary(it.body) }.orEmpty()
-                if (balanceLines.isNotEmpty()) {
+                val balanceRows = balanceResult?.let { parseBalanceSummary(it.body) }.orEmpty()
+                if (balanceRows.isNotEmpty()) {
                     Spacer(Modifier.height(8.dp))
                     Text("额度", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    balanceLines.forEach { line ->
+                    balanceRows.forEach { (line, bucket) ->
                         Text(line, style = MaterialTheme.typography.bodyMedium)
+                        val fraction = ZCodeActivation.quotaFraction(bucket.remaining, bucket.total)
+                        if (fraction != null) {
+                            Spacer(Modifier.height(4.dp))
+                            LinearProgressIndicator(
+                                progress = { fraction },
+                                modifier = Modifier.fillMaxWidth(),
+                                color = if (fraction < 0.1f) {
+                                    MaterialTheme.colorScheme.error
+                                } else {
+                                    MaterialTheme.colorScheme.primary
+                                },
+                                trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                            )
+                            ZCodeActivation.quotaPercentText(bucket.remaining, bucket.total)
+                                ?.let { percentText ->
+                                    Text(
+                                        percentText,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                        }
                     }
                 }
                 val planNames = currentResult?.let { parsePlanNames(it.body) }.orEmpty()
