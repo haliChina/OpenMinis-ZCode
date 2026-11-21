@@ -15,6 +15,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -224,9 +227,9 @@ private fun RawOutputBlock(title: String, body: String) {
         )
         androidx.compose.material3.Icon(
             if (expanded) {
-                androidx.compose.material.icons.Icons.Default.ExpandMore
+                Icons.Default.ExpandMore
             } else {
-                androidx.compose.material.icons.Icons.AutoMirrored.Filled.KeyboardArrowRight
+                Icons.AutoMirrored.Filled.KeyboardArrowRight
             },
             contentDescription = if (expanded) "收起" else "展开",
             tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
