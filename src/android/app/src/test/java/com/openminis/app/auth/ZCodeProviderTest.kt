@@ -1028,6 +1028,35 @@ class ZCodeProviderTest {
         assertNull(ZCodeActivation.quotaPercentText(-1, 500))
     }
 
+    // ── Console display formatting ────────────────────────────────────
+
+    @Test
+    fun `format token count groups thousands with commas`() {
+        assertEquals("0", ZCodeActivation.formatTokenCount(0))
+        assertEquals("999", ZCodeActivation.formatTokenCount(999))
+        assertEquals("1,000", ZCodeActivation.formatTokenCount(1000))
+        // The live weekend bucket numbers.
+        assertEquals("428,184,827", ZCodeActivation.formatTokenCount(428184827))
+        assertEquals("500,000,000", ZCodeActivation.formatTokenCount(500000000))
+        assertEquals("-1,234,567", ZCodeActivation.formatTokenCount(-1234567))
+    }
+
+    @Test
+    fun `format epoch seconds renders local date time and rejects non-epoch input`() {
+        val shanghai = java.time.ZoneId.of("Asia/Shanghai")
+        // The weekend plan's ends_at from the live current response.
+        assertEquals("2026-11-23 09:00", ZCodeActivation.formatEpochSeconds("1795395600", shanghai))
+        assertEquals(
+            "2026-11-23 01:00",
+            ZCodeActivation.formatEpochSeconds("1795395600", java.time.ZoneId.of("UTC")),
+        )
+        assertEquals("1970-01-01 08:00", ZCodeActivation.formatEpochSeconds("0", shanghai))
+        assertNull(ZCodeActivation.formatEpochSeconds("", shanghai))
+        assertNull(ZCodeActivation.formatEpochSeconds("garbage", shanghai))
+        // Plain-date expiresAt values are not epoch seconds.
+        assertNull(ZCodeActivation.formatEpochSeconds("2026-11-08", shanghai))
+    }
+
     // ── Model id normalization + wire form (#22, #23) ─────────────────
 
     @Test

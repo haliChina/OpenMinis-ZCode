@@ -496,7 +496,7 @@ object ZCodeActivation {
      * because the server's day boundary is not guaranteed to match the
      * phone's. These ids are the author's empirical values — they are
      * offered only as selectable fallback entries, never auto-claimed,
-     * and the console marks them "兑底（待实测）".
+     * and the console marks them "兜底（待实测）".
      */
     fun buildDateCodedFallbackIds(todayCst: java.time.LocalDate): List<String> {
         val out = mutableListOf<String>()
@@ -648,5 +648,26 @@ object ZCodeActivation {
     fun quotaPercentText(remaining: Long, total: Long): String? {
         val fraction = quotaFraction(remaining, total) ?: return null
         return "剩余 " + String.format(Locale.US, "%.1f%%", fraction * 100f)
+    }
+
+    // ── Console display formatting ────────────────────────────────────
+
+    /** Thousands-grouped token count for the console ("428,184,827").
+     *  Grouping pinned to Locale.US, the same convention as
+     *  [quotaPercentText]; negative values keep their sign. */
+    fun formatTokenCount(value: Long): String =
+        String.format(Locale.US, "%,d", value)
+
+    /** A bucket's expiresAt is an epoch-SECONDS string (e.g.
+     *  "1795395600"); render it as local "yyyy-MM-dd HH:mm" in [zone].
+     *  Null when the raw value is empty or not a number, so the caller
+     *  can simply omit the field. (Some buckets carry a plain date like
+     *  "2026-11-08" instead — that is not epoch seconds and also maps
+     *  to null here; the caller falls back to showing it verbatim.) */
+    fun formatEpochSeconds(raw: String, zone: java.time.ZoneId): String? {
+        val seconds = raw.trim().toLongOrNull() ?: return null
+        return java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm", Locale.US)
+            .withZone(zone)
+            .format(java.time.Instant.ofEpochSecond(seconds))
     }
 }
