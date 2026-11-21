@@ -128,6 +128,15 @@ class ZCodeProvider(
         /** The per-account in-flight cap (upstream-observed: 2). */
         private fun semaphoreFor(instanceId: String): Semaphore =
             concurrencyByInstance.getOrPut(instanceId) { Semaphore(2) }
+
+        /**
+         * [T-zcode-broadcast] The SAME per-instance semaphore the chat
+         * path draws from, for the in-app broadcast server: the cap is
+         * per ACCOUNT, not per entry point, so chat and broadcast
+         * share one budget of 2 in-flight upstream requests.
+         */
+        internal fun sharedSemaphoreFor(instanceId: String): Semaphore =
+            semaphoreFor(instanceId)
     }
 
     /** Fallback device id for context-less construction (no manager to
