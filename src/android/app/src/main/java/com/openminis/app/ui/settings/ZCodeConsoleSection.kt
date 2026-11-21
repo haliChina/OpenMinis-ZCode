@@ -6,6 +6,8 @@ import android.os.Looper
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -26,6 +28,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
@@ -176,28 +179,6 @@ fun ZCodeCaptchaDialog() {
 
 // ── Console section ────────────────────────────────────────────────────
 
-/** One balance bucket's summary line, text identical to what the
- *  console has always shown (name / remaining / total / used /
- *  period / capabilities / expiry). */
-private fun balanceSummaryLine(b: ZCodeActivation.BalanceBucket): String =
-    listOfNotNull(
-        b.name.ifEmpty { null },
-        if (b.remaining >= 0) "剩余 ${b.remaining}" else null,
-        if (b.total >= 0) "/ 共 ${b.total}" else null,
-        if (b.used >= 0) "(已用 ${b.used})" else null,
-        b.periodLabel.ifEmpty { null },
-        if (b.capabilities.isNotEmpty()) "能力 ${b.capabilities.joinToString(",")}" else null,
-        if (b.expiresAt.isNotEmpty()) "到期 ${b.expiresAt}" else null,
-    ).joinToString(" ").ifEmpty { "（空）" }
-
-/** (summary line, bucket) rows for the 额度 block: the line is the
- *  display text, the bucket rides along so the row can draw its
- *  quota bar from the same parse. */
-private fun parseBalanceSummary(body: String): List<Pair<String, ZCodeActivation.BalanceBucket>> =
-    ZCodeActivation.parseBalanceDetail(body).buckets.map { bucket ->
-        balanceSummaryLine(bucket) to bucket
-    }
-
 private fun parsePlanNames(body: String): List<String> {
     val names = mutableListOf<String>()
     val data = runCatching { JSONObject(body).optJSONObject("data") }.getOrNull() ?: return names
@@ -229,10 +210,10 @@ private const val RAW_OUTPUT_MAX_CHARS = 4000
 private fun RawOutputBlock(title: String, body: String) {
     var expanded by remember { mutableStateOf(false) }
     androidx.compose.foundation.layout.Row(
-        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+        verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
             .fillMaxWidth()
-            .androidx.compose.foundation.clickable { expanded = !expanded }
+            .clickable { expanded = !expanded }
             .padding(vertical = 4.dp),
     ) {
         Text(
@@ -407,7 +388,7 @@ fun ColumnScope.ZCodeConsoleSection(
                 ) { Text(if (busy == "查可领") "查询中…" else "查可领") }
                 Spacer(Modifier.height(8.dp))
                 androidx.compose.foundation.layout.Row(
-                    horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     MinisOutlinedButton(
@@ -455,12 +436,57 @@ fun ColumnScope.ZCodeConsoleSection(
                     Text(prefetchStatus!!, style = MaterialTheme.typography.bodyMedium)
                 }
 
-                val balanceRows = balanceResult?.let { parseBalanceSummary(it.body) }.orEmpty()
-                if (balanceRows.isNotEmpty()) {
+                val balanceBuckets = balanceResult?.let {
+                    ZCodeActivation.parseBalanceDetail(it.body).buckets
+                }.orEmpty()
+                if (balanceBuckets.isNotEmpty()) {
                     Spacer(Modifier.height(8.dp))
                     Text("额度", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    balanceRows.forEach { (line, bucket) ->
-                        Text(line, style = MaterialTheme.typography.bodyMedium)
+                    balanceBuckets.forEach { bucket ->
+                        // Structured rows (was one joined string):
+                        // name + remaining first, used / total /
+                        // period / capabilities demoted to a small
+                        // detail line, expiry as a local date-time
+                        // instead of raw epoch seconds. Every field
+                        // of the old line still appears; the quota
+                        // bar below is unchanged.
+                        androidx.compose.foundation.layout.Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(
+                                bucket.name.ifEmpty { "额度" },
+                                style = MaterialTheme.typography.bodyMedium,
+                                modifier = Modifier.weight(1f),
+                            )
+                            if (bucket.remaining >= 0) {
+                                Text(
+                                    "剩余 ${ZCodeActivation.formatTokenCount(bucket.remaining)}",
+                                    style = MaterialTheme.typography.bodyLarge,
+                                )
+                            }
+                        }
+                        val detailParts = listOfNotNull(
+                            if (bucket.used >= 0) "已用 ${ZCodeActivation.formatTokenCount(bucket.used)}" else null,
+                            if (bucket.total >= 0) "共 ${ZCodeActivation.formatTokenCount(bucket.total)}" else null,
+                            bucket.periodLabel.ifEmpty { null },
+                            if (bucket.capabilities.isNotEmpty()) {
+                                "能力 ${bucket.capabilities.joinToString(",")}"
+                            } else null,
+                            if (bucket.expiresAt.isNotEmpty()) {
+                                "到期 " + (ZCodeActivation.formatEpochSeconds(
+                                    bucket.expiresAt,
+                                    java.time.ZoneId.systemDefault(),
+                                ) ?: bucket.expiresAt)
+                            } else null,
+                        )
+                        if (detailParts.isNotEmpty()) {
+                            Text(
+                                detailParts.joinToString(" · "),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
                         val fraction = ZCodeActivation.quotaFraction(bucket.remaining, bucket.total)
                         if (fraction != null) {
                             Spacer(Modifier.height(4.dp))
