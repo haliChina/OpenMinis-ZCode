@@ -210,6 +210,62 @@ private fun parsePlanNames(body: String): List<String> {
     return names
 }
 
+/** Truncation cap shared by every raw-output block (claim used to be
+ *  2000 while the raw responses were 4000 — unified here). */
+private const val RAW_OUTPUT_MAX_CHARS = 4000
+
+/**
+ * One raw response body behind a collapsed-by-default header row —
+ * the interaction shape is copied from UsageStatsScreen's expandable
+ * group rows (chevron + AnimatedVisibility). Raw JSON is debugging
+ * material: it used to occupy a 160dp box each (the claim body had
+ * no height cap at all), pushing ~500dp of noise under every result.
+ * Expanded, the content is the same 160dp scrolling monospace box
+ * as before. The expanded state is per block and is NOT reset when
+ * a new result arrives, so a debugging session keeps its blocks open.
+ */
+@Composable
+private fun RawOutputBlock(title: String, body: String) {
+    var expanded by remember { mutableStateOf(false) }
+    androidx.compose.foundation.layout.Row(
+        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .androidx.compose.foundation.clickable { expanded = !expanded }
+            .padding(vertical = 4.dp),
+    ) {
+        Text(
+            title,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.weight(1f),
+        )
+        androidx.compose.material3.Icon(
+            if (expanded) {
+                androidx.compose.material.icons.Icons.Default.ExpandMore
+            } else {
+                androidx.compose.material.icons.Icons.AutoMirrored.Filled.KeyboardArrowRight
+            },
+            contentDescription = if (expanded) "收起" else "展开",
+            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+        )
+    }
+    androidx.compose.animation.AnimatedVisibility(visible = expanded) {
+        androidx.compose.foundation.layout.Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(160.dp)
+                .verticalScroll(rememberScrollState()),
+        ) {
+            Text(
+                body.take(RAW_OUTPUT_MAX_CHARS).ifEmpty { "（空）" },
+                style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
 @Composable
 fun ColumnScope.ZCodeConsoleSection(
     instance: ProviderInstance,
@@ -544,60 +600,19 @@ fun ColumnScope.ZCodeConsoleSection(
                 }
                 if (claimResult != null) {
                     Spacer(Modifier.height(8.dp))
-                    Text("领取返回", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text(
-                        claimResult!!.body.take(2000),
-                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+                    RawOutputBlock("领取返回", claimResult!!.body)
                 }
                 if (balanceResult != null) {
                     Spacer(Modifier.height(8.dp))
-                    Text("额度原始返回", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    androidx.compose.foundation.layout.Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(160.dp)
-                            .verticalScroll(rememberScrollState()),
-                    ) {
-                        Text(
-                            balanceResult!!.body.take(4000),
-                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
+                    RawOutputBlock("额度原始返回", balanceResult!!.body)
                 }
                 if (previewResult != null) {
                     Spacer(Modifier.height(8.dp))
-                    Text("可领原始返回", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    androidx.compose.foundation.layout.Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(160.dp)
-                            .verticalScroll(rememberScrollState()),
-                    ) {
-                        Text(
-                            previewResult!!.body.take(4000),
-                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
+                    RawOutputBlock("可领原始返回", previewResult!!.body)
                 }
                 if (touchResult != null) {
                     Spacer(Modifier.height(8.dp))
-                    Text("活动发现原始返回", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    androidx.compose.foundation.layout.Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(160.dp)
-                            .verticalScroll(rememberScrollState()),
-                    ) {
-                        Text(
-                            touchResult!!.body.take(4000).ifEmpty { "（空）" },
-                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
+                    RawOutputBlock("活动发现原始返回", touchResult!!.body)
                 }
             }
         }
