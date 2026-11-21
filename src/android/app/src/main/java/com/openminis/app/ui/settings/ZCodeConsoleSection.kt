@@ -53,7 +53,7 @@ import org.json.JSONObject
  *   查可领   激活上报（app_launch + app_daily_active + app_login_success）→ GET
  *            marketing/touch（seq 递增）→ touch 为空时再 GET billing/preview
  *            （带 app_version/platform）；touch 优先，preview 只作备用；
- *            两路都空时列出日期编码兑底 id（可选手册领取，待实测）；
+ *            两路都空时列出日期编码兜底 id（可选手册领取，待实测）；
  *            仍无可领时用 balance + current 交叉验证账号到底有无套餐。
  *            上报失败不阻断继续。
  *   领取     POST billing/claim {"plan_id": <the id the user picked>}；
@@ -338,7 +338,7 @@ fun ColumnScope.ZCodeConsoleSection(
                                     ZCodeActivation.ClaimablePlan(
                                         id = id,
                                         name = id,
-                                        description = "兑底（待实测）",
+                                        description = "兜底（待实测）",
                                         source = ZCodeActivation.ClaimablePlan.Source.FALLBACK,
                                     )
                                 }
@@ -357,7 +357,7 @@ fun ColumnScope.ZCodeConsoleSection(
                             selectedPlan = null
                             val act = activationResult!!
                             statusLine = "激活上报${act.message}；可领计划已读取" +
-                                if (merged.isEmpty()) "（两路都空，已列出兑底 id）。" else "。"
+                                if (merged.isEmpty()) "（两路都空，已列出兜底 id）。" else "。"
                         }
                     },
                     modifier = Modifier.fillMaxWidth(),
@@ -507,7 +507,7 @@ fun ColumnScope.ZCodeConsoleSection(
                                 })
                             }
                             if (plan.source == ZCodeActivation.ClaimablePlan.Source.FALLBACK) {
-                                append(" · 兑底 id，未验证是否有效")
+                                append(" · 兜底 id，未验证是否有效")
                             }
                         }
                         SettingsRow(

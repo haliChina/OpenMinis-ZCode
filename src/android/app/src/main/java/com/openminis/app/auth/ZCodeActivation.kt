@@ -496,7 +496,7 @@ object ZCodeActivation {
      * because the server's day boundary is not guaranteed to match the
      * phone's. These ids are the author's empirical values — they are
      * offered only as selectable fallback entries, never auto-claimed,
-     * and the console marks them "兑底（待实测）".
+     * and the console marks them "兜底（待实测）".
      */
     fun buildDateCodedFallbackIds(todayCst: java.time.LocalDate): List<String> {
         val out = mutableListOf<String>()
