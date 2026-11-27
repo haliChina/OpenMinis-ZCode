@@ -919,6 +919,133 @@ class ZCodeProviderTest {
         assertTrue(healthy.hasBalance)
     }
 
+    // ── Cross-check reads balance entitlements (#13, v400) ─────────────
+
+    // Verbatim shape of the 2026-11-27 balance body: plan claimed,
+    // entitlement effective 23:00, balances empty, current dataless.
+    private val pendingWeekendBalance = """{"code":0,"data":{
+        "server_time":1795784214,
+        "plans":[{"user_plan_id":"upl_1","plan_id":"zcode-v3-start-plan-1127",
+        "name":"ZCODE WEEKEND BUILD","status":"active",
+        "starts_at":1795781592,"ends_at":1796000400,
+        "entitlements":[{"entitlement_id":"ent-1","show_name":"GLM-5.3-Flash",
+        "meter":"model_usage","unit_type":"token",
+        "capabilities":["model:glm-5.3-flash"],"grant_units":300000000,
+        "period":"one_time","priority":101,"effective_at":1795791600}]}],
+        "balances":[]}}"""
+    private val datalessCurrent = """{"code":0,"msg":""}"""
+    // 2026-11-27 20:56 CST, before the 23:00 effective time.
+    private val beforeEffectiveMs = 1_795_784_214_000L
+    private val cst = java.time.ZoneId.of("Asia/Shanghai")
+
+    @Test
+    fun `cross-check reports claimed but not yet effective entitlement`() {
+        val cc = ZCodeActivation.crossCheckPlan(
+            pendingWeekendBalance, datalessCurrent, beforeEffectiveMs, cst,
+        )
+        assertTrue(cc.hasPlan)
+        assertFalse(cc.hasBalance)
+        assertEquals(1, cc.pendingEntitlements.size)
+        assertEquals("zcode-v3-start-plan-1127", cc.pendingEntitlements[0].planId)
+        assertEquals(300_000_000L, cc.pendingEntitlements[0].grantUnits)
+        assertEquals(1_795_791_600L, cc.pendingEntitlements[0].effectiveAtSeconds)
+        assertTrue(cc.effectiveEntitlements.isEmpty())
+        assertEquals("已领 ZCODE WEEKEND BUILD，额度今晚 23:00 生效", cc.summary)
+    }
+
+    @Test
+    fun `cross-check prefers server_time over the device clock`() {
+        // Device clock already past 23:00, but the server says 20:56.
+        val cc = ZCodeActivation.crossCheckPlan(
+            pendingWeekendBalance, datalessCurrent, 1_795_795_200_000L, cst,
+        )
+        assertEquals(1, cc.pendingEntitlements.size)
+        assertEquals("已领 ZCODE WEEKEND BUILD，额度今晚 23:00 生效", cc.summary)
+    }
+
+    @Test
+    fun `cross-check renders a later day as a full date`() {
+        val tomorrow = pendingWeekendBalance.replace("1795791600", "1795878000")
+        val cc = ZCodeActivation.crossCheckPlan(
+            tomorrow, datalessCurrent, beforeEffectiveMs, cst,
+        )
+        assertEquals("已领 ZCODE WEEKEND BUILD，额度2026-11-28 23:00 生效", cc.summary)
+    }
+
+    @Test
+    fun `cross-check still reports the pending pack when a live balance exists`() {
+        val body = pendingWeekendBalance.replace(
+            """"balances":[]""", """"balances":[{"remaining_units":500}]""",
+        )
+        val cc = ZCodeActivation.crossCheckPlan(
+            body, datalessCurrent, beforeEffectiveMs, cst,
+        )
+        assertTrue(cc.hasBalance)
+        assertEquals("已领 ZCODE WEEKEND BUILD，额度今晚 23:00 生效", cc.summary)
+    }
+
+    @Test
+    fun `cross-check reports effective entitlement with no balance bucket`() {
+        // Same body, but no server_time and the clock past 23:00, so
+        // the grant counts as effective — a missing bucket is a server
+        // lag, never a zero balance.
+        val body = pendingWeekendBalance.replace(
+            """"server_time":1795784214,""", "",
+        )
+        val cc = ZCodeActivation.crossCheckPlan(
+            body, datalessCurrent, 1_795_800_000_000L, cst,
+        )
+        assertTrue(cc.hasPlan)
+        assertFalse(cc.hasBalance)
+        assertTrue(cc.pendingEntitlements.isEmpty())
+        assertEquals(1, cc.effectiveEntitlements.size)
+        assertEquals("套餐 ZCODE WEEKEND BUILD 已生效，但 balance 未返回余额", cc.summary)
+    }
+
+    @Test
+    fun `cross-check treats an entitlement without effective_at as live`() {
+        val body = """{"code":0,"data":{"plans":[{"plan_id":"p1","show_name":"Daily",
+            "entitlements":[{"show_name":"GLM-5.3-Flash","meter":"model_usage",
+            "unit_type":"token","grant_units":8000000}]}],"balances":[]}}"""
+        val cc = ZCodeActivation.crossCheckPlan(
+            body, datalessCurrent, beforeEffectiveMs, cst,
+        )
+        assertTrue(cc.pendingEntitlements.isEmpty())
+        assertEquals(1, cc.effectiveEntitlements.size)
+        assertEquals("套餐 Daily 已生效，但 balance 未返回余额", cc.summary)
+    }
+
+    @Test
+    fun `cross-check ignores zero grants and non token entitlements`() {
+        val body = """{"code":0,"data":{"plans":[{"plan_id":"p1","show_name":"P",
+            "entitlements":[
+              {"show_name":"Zero","meter":"model_usage","unit_type":"token","grant_units":0,"effective_at":1795791600},
+              {"show_name":"Other","meter":"api_calls","unit_type":"count","grant_units":5,"effective_at":1795791600}
+            ]}],"balances":[]}}"""
+        val cc = ZCodeActivation.crossCheckPlan(
+            body, datalessCurrent, beforeEffectiveMs, cst,
+        )
+        assertTrue(cc.hasPlan)
+        assertFalse(cc.hasBalance)
+        assertTrue(cc.pendingEntitlements.isEmpty())
+        assertTrue(cc.effectiveEntitlements.isEmpty())
+        assertEquals("账号有套餐，但 balance 余额为 0", cc.summary)
+    }
+
+    @Test
+    fun `cross-check keeps the original wording when all three are empty`() {
+        val cc = ZCodeActivation.crossCheckPlan(
+            """{"code":0,"data":{"plans":[],"balances":[]}}""",
+            """{"code":0,"data":{"plans":[]}}""",
+            beforeEffectiveMs, cst,
+        )
+        assertFalse(cc.hasPlan)
+        assertFalse(cc.hasBalance)
+        assertTrue(cc.pendingEntitlements.isEmpty())
+        assertTrue(cc.effectiveEntitlements.isEmpty())
+        assertEquals("账号无套餐、无余额（current 与 balance 均为空）", cc.summary)
+    }
+
     // ── Balance-derived models (#14) ───────────────────────────────────
 
     @Test
