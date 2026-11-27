@@ -118,7 +118,7 @@ object ZCodeActivation {
 
     /**
      * The preview path with the query parameters upstream wants:
-     * `billing/preview?app_version=3.17.1&platform=android-arm64`.
+     * `billing/preview?app_version=4.0.0&platform=android-arm64`.
      * Both values are URL-safe by construction (digits, dots, hyphens),
      * so no encoding is needed.
      */
@@ -414,22 +414,65 @@ object ZCodeActivation {
     /** What billing/current + billing/balance say about the account,
      *  used when preview comes back empty: distinguishes "no plan at
      *  all" from "has a plan but nothing claimable" (liu5269
-     *  app/quota.py:61-89). */
+     *  app/quota.py:61-89). Since 2026-11-27 the balance body also
+     *  carries `data.plans[].entitlements[]` with `effective_at`
+     *  (epoch seconds): a claimed plan whose entitlement is not yet
+     *  effective shows up with an empty `balances` array, which the
+     *  old check misread as "no plan, no balance". */
     data class CrossCheck(
         val hasPlan: Boolean,
         val hasBalance: Boolean,
         val summary: String,
+        /** Claimed entitlements whose effective time is still in the
+         *  future, earliest first. Empty when nothing is pending. */
+        val pendingEntitlements: List<PlanEntitlement> = emptyList(),
+        /** Entitlements already effective (or with no effective_at),
+         *  earliest first. Only meaningful next to [hasBalance]. */
+        val effectiveEntitlements: List<PlanEntitlement> = emptyList(),
     )
 
-    fun crossCheckPlan(balanceBody: String, currentBody: String): CrossCheck {
-        val plans = runCatching {
+    /** One token entitlement on a balance plan, with its effective
+     *  time. `effectiveAtSeconds` is 0 when the body carries none —
+     *  an entitlement without an effective time is effective
+     *  immediately. */
+    data class PlanEntitlement(
+        val planId: String,
+        val planName: String,
+        val grantName: String,
+        val grantUnits: Long,
+        val effectiveAtSeconds: Long,
+    )
+
+    /**
+     * Cross-check with entitlement awareness. [nowMs] is the device
+     * clock; the balance body's `data.server_time` (epoch seconds)
+     * wins over it when present, because the effective_at comparison
+     * is against the server's clock. [zone] is only used to render
+     * the pending effective time. The defaults keep the two console
+     * call sites unchanged.
+     */
+    fun crossCheckPlan(
+        balanceBody: String,
+        currentBody: String,
+        nowMs: Long = System.currentTimeMillis(),
+        zone: java.time.ZoneId = java.time.ZoneId.systemDefault(),
+    ): CrossCheck {
+        val balanceData = runCatching {
+            JSONObject(balanceBody).optJSONObject("data")
+        }.getOrNull()
+        val currentPlans = runCatching {
             JSONObject(currentBody).optJSONObject("data")?.optJSONArray("plans")
         }.getOrNull()
-        val hasPlan = (plans?.length() ?: 0) > 0
+        val balancePlans = balanceData?.optJSONArray("plans")
+        val hasPlan = (currentPlans?.length() ?: 0) > 0 ||
+            (balancePlans?.length() ?: 0) > 0
         var hasBalance = false
-        val balances = runCatching {
-            JSONObject(balanceBody).optJSONObject("data")?.optJSONArray("balances")
-        }.getOrNull()
+        val balances = balanceData?.optJSONArray("balances")
+        // Whether the body carried any balance bucket at all: a missing
+        // or empty `balances` array means the server returned no balance
+        // info (lag/omission), while present buckets that are all zero
+        // mean the grant is spent — two different states, two lines.
+        val balancesReturned = (balances?.length() ?: 0) > 0
         if (balances != null) {
             for (i in 0 until balances.length()) {
                 val b = balances.optJSONObject(i) ?: continue
@@ -439,13 +482,99 @@ object ZCodeActivation {
                 }
             }
         }
+        // Reference "now" in epoch seconds: the server's own clock
+        // when the body carries one, else the device clock.
+        val serverTime = balanceData?.optLong("server_time", 0) ?: 0
+        val nowSeconds = if (serverTime > 0) serverTime else nowMs / 1000
+        val entitlements = parseBalancePlanEntitlements(balancePlans)
+        val pending = entitlements.filter { it.effectiveAtSeconds > nowSeconds }
+            .sortedBy { it.effectiveAtSeconds }
+        val effective = entitlements.filter { it.effectiveAtSeconds <= nowSeconds }
+            .sortedBy { it.effectiveAtSeconds }
         val summary = when {
+            pending.isNotEmpty() -> {
+                val first = pending.first()
+                // "Tonight" is judged against the same clock as the
+                // pending decision (server time when present).
+                val displayNowMs = if (serverTime > 0) serverTime * 1000 else nowMs
+                "已领 ${first.planName}，额度${formatPendingEffectiveAt(first.effectiveAtSeconds, displayNowMs, zone)} 生效"
+            }
+            // An effective grant with no balance bucket at all is a
+            // server lag/omission, not a zero balance — never report it
+            // as 0. Buckets present but all zero mean the grant is
+            // spent, which the "余额为 0" line below covers.
+            effective.isNotEmpty() && !hasBalance && !balancesReturned ->
+                "套餐 ${effective.first().planName} 已生效，但 balance 未返回余额"
             !hasPlan && !hasBalance -> "账号无套餐、无余额（current 与 balance 均为空）"
             !hasPlan -> "current 无套餐，但 balance 仍有余额"
             !hasBalance -> "账号有套餐，但 balance 余额为 0"
             else -> "账号有套餐且有余额，只是当前没有可领计划"
         }
-        return CrossCheck(hasPlan, hasBalance, summary)
+        return CrossCheck(hasPlan, hasBalance, summary, pending, effective)
+    }
+
+    /**
+     * Token entitlements on balance plans: only `meter=model_usage`
+     * + `unit_type=token` grants with `grant_units > 0`. The units
+     * filter is extra here — [parseEntitlements] keeps zero-unit
+     * grants. `effective_at` accepts a number or a numeric string,
+     * snake_case or camelCase; absent means 0.
+     * Never throws; unparseable bodies yield an empty list.
+     */
+    fun parseBalancePlanEntitlements(plans: JSONArray?): List<PlanEntitlement> {
+        if (plans == null) return emptyList()
+        val out = mutableListOf<PlanEntitlement>()
+        for (i in 0 until plans.length()) {
+            val p = plans.optJSONObject(i) ?: continue
+            val planId = p.optString("plan_id", "").ifEmpty { p.optString("planId", "") }
+            if (planId.isEmpty()) continue
+            val planName = p.optString("show_name", "")
+                .ifEmpty { p.optString("showName", "") }
+                .ifEmpty { p.optString("name", "") }
+                .ifEmpty { planId }
+            val ents = p.optJSONArray("entitlements") ?: continue
+            for (j in 0 until ents.length()) {
+                val e = ents.optJSONObject(j) ?: continue
+                if (e.optString("meter", "") != "model_usage") continue
+                val unitType = e.optString("unit_type", "").ifEmpty { e.optString("unitType", "") }
+                if (unitType != "token") continue
+                val units = if (e.has("grant_units")) e.optLong("grant_units", 0)
+                else e.optLong("grantUnits", 0)
+                if (units <= 0) continue
+                val effectiveAt = when (val raw = e.opt("effective_at")) {
+                    is Number -> raw.toLong()
+                    is String -> raw.trim().toLongOrNull() ?: 0
+                    else -> e.optString("effectiveAt", "").trim().toLongOrNull() ?: 0
+                }
+                val grantName = e.optString("show_name", "")
+                    .ifEmpty { e.optString("showName", "") }
+                    .ifEmpty { e.optString("name", "") }
+                out.add(PlanEntitlement(planId, planName, grantName, units, effectiveAt))
+            }
+        }
+        return out
+    }
+
+    /**
+     * Render a pending effective time for the cross-check line: "今晚
+     * HH:mm" when it falls on the same local date as [nowMs], else the
+     * full "yyyy-MM-dd HH:mm" from [formatEpochSeconds]. The caller
+     * appends "生效".
+     */
+    fun formatPendingEffectiveAt(
+        effectiveAtSeconds: Long,
+        nowMs: Long,
+        zone: java.time.ZoneId,
+    ): String {
+        val today = java.time.Instant.ofEpochMilli(nowMs).atZone(zone).toLocalDate()
+        val day = java.time.Instant.ofEpochSecond(effectiveAtSeconds).atZone(zone).toLocalDate()
+        if (day == today) {
+            val time = java.time.format.DateTimeFormatter.ofPattern("HH:mm", Locale.US)
+                .withZone(zone)
+                .format(java.time.Instant.ofEpochSecond(effectiveAtSeconds))
+            return "今晚 $time"
+        }
+        return formatEpochSeconds(effectiveAtSeconds.toString(), zone) ?: "未知时间"
     }
 
     // ── Balance-derived models (#14) ───────────────────────────────────

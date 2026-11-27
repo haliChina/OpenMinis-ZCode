@@ -32,6 +32,9 @@ import com.openminis.app.data.model.LLMModel
  *   Block 1 has no `cache_control` in the official client either.
  *   Whether upstream actually fingerprint-checks the text (3012) is
  *   still unproven — the bundle only shows what the client sends.
+ *   4.0.0 changelog checked 2026-11-27 (zcode.z.ai/en/changelog +
+ *   GitHub Releases) for system-prompt, endpoint, and auth-header
+ *   changes: no listed change; live verification still required.
  */
 object ZCodeConstants {
 
@@ -111,10 +114,14 @@ object ZCodeConstants {
      */
     const val PUBLIC_CLIENT_ID = "client_P8X5CMWmlaRO9gyO-KSqtg"
 
-    /** Client version we claim. Pinned to the version dengyie's gateway
-     *  verified against the live service (3.17.1); claim bumps have
-     *  previously flipped 1004 "not eligible" on claim calls. */
-    const val CLIENT_APP_VERSION = "3.17.1"
+    /** Client version we claim. Pinned to 4.0.0 (released 2026-11-23);
+     *  the manifest auto-follow (#19) adopts newer versions at runtime
+     *  when the manifest reports them; this pin is the fallback for
+     *  fresh installs / before the first manifest check. Claim bumps
+     *  have previously flipped 1004 "not eligible" on claim calls, so
+     *  a bump is a real behavior change, not a cosmetic one — the live
+     *  3012 behavior of a new pin is only verifiable on-device. */
+    const val CLIENT_APP_VERSION = "4.0.0"
 
     /**
      * Runtime version override from the manifest auto-follow (#19).
