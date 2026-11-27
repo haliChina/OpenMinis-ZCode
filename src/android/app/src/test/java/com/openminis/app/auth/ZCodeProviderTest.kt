@@ -1003,6 +1003,112 @@ class ZCodeProviderTest {
     }
 
     @Test
+    fun `cross-check reports zero balance when buckets exist but are spent`() {
+        // Real shape from last week: the 500M weekend pack claimed
+        // 11-20, spent by 11-23 — an effective grant plus a bucket
+        // at remaining 0 is "spent", not "server gave no number".
+        val body = pendingWeekendBalance.replace(
+            """"server_time":1795784214,""", "",
+        ).replace(
+            """"balances":[]""", """"balances":[{"remaining_units":0}]""",
+        )
+        val cc = ZCodeActivation.crossCheckPlan(
+            body, datalessCurrent, 1_795_800_000_000L, cst,
+        )
+        assertTrue(cc.hasPlan)
+        assertFalse(cc.hasBalance)
+        assertTrue(cc.pendingEntitlements.isEmpty())
+        assertEquals(1, cc.effectiveEntitlements.size)
+        assertEquals("账号有套餐，但 balance 余额为 0", cc.summary)
+    }
+
+    @Test
+    fun `cross-check reports no balance when the balances array is missing`() {
+        // Same effective grant, but the body carries no `balances`
+        // key at all — a server omission, not a zero balance.
+        val body = pendingWeekendBalance.replace(
+            """"server_time":1795784214,""", "",
+        ).replace(""","balances":[]""", "")
+        val cc = ZCodeActivation.crossCheckPlan(
+            body, datalessCurrent, 1_795_800_000_000L, cst,
+        )
+        assertTrue(cc.hasPlan)
+        assertFalse(cc.hasBalance)
+        assertEquals(1, cc.effectiveEntitlements.size)
+        assertEquals("套餐 ZCODE WEEKEND BUILD 已生效，但 balance 未返回余额", cc.summary)
+    }
+
+    @Test
+    fun `cross-check sorts multiple pending entitlements earliest first`() {
+        val body = """{"code":0,"data":{
+            "server_time":1795784214,
+            "plans":[{"plan_id":"p-later","show_name":"Later",
+            "entitlements":[{"show_name":"GLM-5.3-Flash","meter":"model_usage",
+            "unit_type":"token","grant_units":100000000,"effective_at":1795878000}]},
+            {"plan_id":"p-soon","show_name":"Sooner",
+            "entitlements":[{"show_name":"GLM-5.3-Flash","meter":"model_usage",
+            "unit_type":"token","grant_units":200000000,"effective_at":1795791600}]}],
+            "balances":[]}}"""
+        val cc = ZCodeActivation.crossCheckPlan(
+            body, datalessCurrent, beforeEffectiveMs, cst,
+        )
+        assertEquals(2, cc.pendingEntitlements.size)
+        assertEquals("p-soon", cc.pendingEntitlements[0].planId)
+        assertEquals("p-later", cc.pendingEntitlements[1].planId)
+        assertEquals("已领 Sooner，额度今晚 23:00 生效", cc.summary)
+    }
+
+    @Test
+    fun `cross-check lists pending and effective entitlements together`() {
+        val body = """{"code":0,"data":{
+            "server_time":1795784214,
+            "plans":[{"plan_id":"p-old","show_name":"Old",
+            "entitlements":[{"show_name":"GLM-5.3-Flash","meter":"model_usage",
+            "unit_type":"token","grant_units":8000000,"effective_at":1795705200}]},
+            {"plan_id":"p-new","show_name":"New",
+            "entitlements":[{"show_name":"GLM-5.3-Flash","meter":"model_usage",
+            "unit_type":"token","grant_units":300000000,"effective_at":1795791600}]}],
+            "balances":[]}}"""
+        val cc = ZCodeActivation.crossCheckPlan(
+            body, datalessCurrent, beforeEffectiveMs, cst,
+        )
+        assertEquals(1, cc.pendingEntitlements.size)
+        assertEquals("p-new", cc.pendingEntitlements[0].planId)
+        assertEquals(1, cc.effectiveEntitlements.size)
+        assertEquals("p-old", cc.effectiveEntitlements[0].planId)
+        assertEquals("已领 New，额度今晚 23:00 生效", cc.summary)
+    }
+
+    @Test
+    fun `cross-check accepts a numeric string effective_at`() {
+        val body = pendingWeekendBalance.replace("1795791600", "\"1795791600\"")
+        val cc = ZCodeActivation.crossCheckPlan(
+            body, datalessCurrent, beforeEffectiveMs, cst,
+        )
+        assertEquals(1, cc.pendingEntitlements.size)
+        assertEquals(1_795_791_600L, cc.pendingEntitlements[0].effectiveAtSeconds)
+        assertEquals("已领 ZCODE WEEKEND BUILD，额度今晚 23:00 生效", cc.summary)
+    }
+
+    @Test
+    fun `cross-check accepts camelCase effectiveAt and grantUnits`() {
+        val body = """{"code":0,"data":{
+            "server_time":1795784214,
+            "plans":[{"planId":"p1","showName":"Camel",
+            "entitlements":[{"showName":"GLM-5.3-Flash","meter":"model_usage",
+            "unitType":"token","grantUnits":300000000,"effectiveAt":1795791600}]}],
+            "balances":[]}}"""
+        val cc = ZCodeActivation.crossCheckPlan(
+            body, datalessCurrent, beforeEffectiveMs, cst,
+        )
+        assertEquals(1, cc.pendingEntitlements.size)
+        assertEquals("p1", cc.pendingEntitlements[0].planId)
+        assertEquals(300_000_000L, cc.pendingEntitlements[0].grantUnits)
+        assertEquals(1_795_791_600L, cc.pendingEntitlements[0].effectiveAtSeconds)
+        assertEquals("已领 Camel，额度今晚 23:00 生效", cc.summary)
+    }
+
+    @Test
     fun `cross-check treats an entitlement without effective_at as live`() {
         val body = """{"code":0,"data":{"plans":[{"plan_id":"p1","show_name":"Daily",
             "entitlements":[{"show_name":"GLM-5.3-Flash","meter":"model_usage",

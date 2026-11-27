@@ -33,8 +33,8 @@ import com.openminis.app.data.model.LLMModel
  *   Whether upstream actually fingerprint-checks the text (3012) is
  *   still unproven — the bundle only shows what the client sends.
  *   4.0.0 changelog checked 2026-11-27 (zcode.z.ai/en/changelog +
- *   GitHub Releases): no system-prompt, endpoint, or auth-header
- *   change listed, so the 3.17.1 transcription above is unchanged.
+ *   GitHub Releases) for system-prompt, endpoint, and auth-header
+ *   changes: no listed change; live verification still required.
  */
 object ZCodeConstants {
 

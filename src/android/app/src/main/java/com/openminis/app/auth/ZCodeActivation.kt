@@ -468,6 +468,11 @@ object ZCodeActivation {
             (balancePlans?.length() ?: 0) > 0
         var hasBalance = false
         val balances = balanceData?.optJSONArray("balances")
+        // Whether the body carried any balance bucket at all: a missing
+        // or empty `balances` array means the server returned no balance
+        // info (lag/omission), while present buckets that are all zero
+        // mean the grant is spent — two different states, two lines.
+        val balancesReturned = (balances?.length() ?: 0) > 0
         if (balances != null) {
             for (i in 0 until balances.length()) {
                 val b = balances.optJSONObject(i) ?: continue
@@ -494,9 +499,11 @@ object ZCodeActivation {
                 val displayNowMs = if (serverTime > 0) serverTime * 1000 else nowMs
                 "已领 ${first.planName}，额度${formatPendingEffectiveAt(first.effectiveAtSeconds, displayNowMs, zone)} 生效"
             }
-            // An effective grant with no balance bucket is a server
-            // lag/omission, not a zero balance — never report it as 0.
-            effective.isNotEmpty() && !hasBalance ->
+            // An effective grant with no balance bucket at all is a
+            // server lag/omission, not a zero balance — never report it
+            // as 0. Buckets present but all zero mean the grant is
+            // spent, which the "余额为 0" line below covers.
+            effective.isNotEmpty() && !hasBalance && !balancesReturned ->
                 "套餐 ${effective.first().planName} 已生效，但 balance 未返回余额"
             !hasPlan && !hasBalance -> "账号无套餐、无余额（current 与 balance 均为空）"
             !hasPlan -> "current 无套餐，但 balance 仍有余额"
@@ -508,9 +515,10 @@ object ZCodeActivation {
 
     /**
      * Token entitlements on balance plans: only `meter=model_usage`
-     * + `unit_type=token` grants with `grant_units > 0` (same filter
-     * as [parseEntitlements]). `effective_at` accepts a number or a
-     * numeric string, snake_case or camelCase; absent means 0.
+     * + `unit_type=token` grants with `grant_units > 0`. The units
+     * filter is extra here — [parseEntitlements] keeps zero-unit
+     * grants. `effective_at` accepts a number or a numeric string,
+     * snake_case or camelCase; absent means 0.
      * Never throws; unparseable bodies yield an empty list.
      */
     fun parseBalancePlanEntitlements(plans: JSONArray?): List<PlanEntitlement> {
