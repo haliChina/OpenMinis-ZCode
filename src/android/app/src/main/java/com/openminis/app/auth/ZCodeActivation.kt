@@ -118,7 +118,7 @@ object ZCodeActivation {
 
     /**
      * The preview path with the query parameters upstream wants:
-     * `billing/preview?app_version=3.17.1&platform=android-arm64`.
+     * `billing/preview?app_version=4.0.0&platform=android-arm64`.
      * Both values are URL-safe by construction (digits, dots, hyphens),
      * so no encoding is needed.
      */

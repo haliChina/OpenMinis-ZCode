@@ -309,7 +309,7 @@ class ZCodeProviderTest {
     @Test
     fun `bigmodel relay url is the official page with app version`() {
         assertEquals(
-            "https://zcode.z.ai/app/oauth/login?redirect=zcode://oauth/callback&app_version=3.17.1",
+            "https://zcode.z.ai/app/oauth/login?redirect=zcode://oauth/callback&app_version=4.0.0",
             ZCodeOAuthManager.buildBigModelRelayUrl(),
         )
     }
@@ -613,7 +613,7 @@ class ZCodeProviderTest {
         assertEquals(0, body.getJSONObject("event_extra_detail").length())
         assertEquals("user-1", body.getString("user_id"))
         assertEquals("1080x2400", body.getString("screen_resolution"))
-        assertEquals("3.17.1", body.getString("app_version"))
+        assertEquals("4.0.0", body.getString("app_version"))
         assertEquals("android", body.getString("device_os_category"))
         assertEquals("14", body.getString("device_os_version"))
         assertEquals("mid-1", body.getString("device_mid"))
